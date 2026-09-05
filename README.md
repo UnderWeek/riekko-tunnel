@@ -2,196 +2,327 @@
 
 # ❄️ Riekko Tunnel
 
-### Private networking without unnecessary complexity.
+### A small, focused tunnel client for private networking.
 
-A focused tunneling client built around speed, clarity and predictable behavior.
+**Simple to start. Clear when something breaks. Quiet when everything works.**
 
-**English** · [Русский](README_RU.md)
+<br>
+
+[English](README.md) · [Русский](README_RU.md)
 
 </div>
 
 ---
 
-## ✨ What is Riekko?
+## 🌨️ Overview
 
-**Riekko Tunnel** is an independent networking project for creating and managing private tunnels.
+**Riekko Tunnel** is a client for creating and managing private network tunnels without turning the process into a maze of settings.
 
-The idea is simple: keep the everyday workflow clear, keep advanced behavior accessible, and avoid turning basic network configuration into a wall of switches.
-
-```text
-┌──────────────────────┐
-│        Riekko        │
-│       Client UI      │
-└──────────┬───────────┘
-           │
-           │ configuration
-           ▼
-┌──────────────────────┐
-│    Tunnel Engine     │
-│ routing / transport  │
-└──────────┬───────────┘
-           │
-           ▼
-        Internet
-```
-
-Riekko is designed to stay out of the way once a connection is established.
-
-## 🎯 Project goals
-
-* ⚡ **Fast connection flow** without unnecessary setup steps
-* 🪶 **Lightweight client** with a small and understandable core
-* 🔐 **Private by design** with no reason to collect unrelated user data
-* 🧩 **Readable configuration** instead of hidden application magic
-* 🛠️ **Useful diagnostics** when a connection fails
-* 🔄 **Reliable state handling** between configuration, connection and UI
-* 🧱 A structure that can grow without turning into a collection of unrelated features
-
-## 🚇 Tunnel workflow
-
-Riekko keeps the normal connection path intentionally straightforward.
+The project is built around a simple idea:
 
 ```text
-Configuration
-     │
-     ▼
-Validation
-     │
-     ▼
-Tunnel startup
-     │
-     ▼
-Route traffic
-     │
-     ▼
-Connected
+config → validate → connect → route → stay out of the way
 ```
 
-The client should make the important state visible without exposing every internal detail at once.
+Riekko is not trying to become a giant networking control panel.
 
-| State             | Meaning                                                     |
-| ----------------- | ----------------------------------------------------------- |
-| ⚪ **Idle**        | No active tunnel                                            |
-| 🟡 **Connecting** | Configuration is being validated and the tunnel is starting |
-| 🟢 **Connected**  | Traffic is routed through the active tunnel                 |
-| 🔴 **Error**      | Startup or connection failed with a readable reason         |
+It is meant to provide a clean layer around the tunnel itself: configuration, connection state, useful diagnostics and a straightforward user experience.
 
-## 🧭 Configuration
+---
 
-Riekko aims to keep configuration explicit and portable.
+## 🧊 What Riekko cares about
 
-A configuration should describe **what should happen**, while the application handles the repetitive parts around starting, stopping and monitoring the tunnel.
+<table>
+<tr>
+<td width="50%">
+
+### ⚡ Fast path
+
+Common actions should stay short.
+
+No unnecessary setup flow just to establish a connection.
+
+</td>
+<td width="50%">
+
+### 🔍 Clear state
+
+The client should always make it obvious whether the tunnel is idle, starting, connected or broken.
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+### 🪶 Small surface
+
+Features should exist because they solve an actual problem, not because another VPN client has them.
+
+</td>
+<td width="50%">
+
+### 🔐 Private by default
+
+A tunneling client has no reason to collect unrelated personal data.
+
+</td>
+</tr>
+</table>
+
+---
+
+## 🛰️ How it fits together
 
 ```text
-┌─────────────────────────────────┐
-│ Riekko configuration            │
-│                                 │
-│ Server      example.net         │
-│ Transport   configured          │
-│ Routing     enabled             │
-│                                 │
-│          [ Connect ]            │
-└─────────────────────────────────┘
+                 ┌─────────────────────┐
+                 │       Riekko        │
+                 │       Client        │
+                 └──────────┬──────────┘
+                            │
+                   validated config
+                            │
+                            ▼
+                 ┌─────────────────────┐
+                 │    Tunnel layer     │
+                 │ transport / routes  │
+                 └──────────┬──────────┘
+                            │
+                            ▼
+                 ┌─────────────────────┐
+                 │       Network       │
+                 └─────────────────────┘
 ```
 
-The exact configuration format is still evolving and may change before the first stable release.
+The client handles the parts a user should not have to manually babysit every time:
 
-## 🧩 Planned interface
+- configuration loading
+- validation
+- tunnel start and stop
+- connection state
+- basic diagnostics
+- recovery from common failures
 
-The project is expected to stay compact rather than grow into a giant networking dashboard.
+The exact backend and supported transports will be documented as the implementation stabilizes.
 
-| Page            | Purpose                                             |
-| --------------- | --------------------------------------------------- |
-| 🏠 **Overview** | Current connection, endpoint and tunnel state       |
-| 🚇 **Tunnels**  | Create, import and manage tunnel configurations     |
-| 📊 **Traffic**  | Basic session statistics and connection information |
-| ⚙️ **Settings** | Application behavior and local preferences          |
+---
 
-## 🗺️ Roadmap
+## 🚦 Connection states
 
-* [ ] Define the core tunnel architecture
-* [ ] Add configuration loading and validation
-* [ ] Implement tunnel lifecycle management
-* [ ] Add connection status and readable errors
-* [ ] Add import and export for configurations
-* [ ] Build the first desktop interface
-* [ ] Add basic traffic statistics
-* [ ] Add reconnect and recovery behavior
-* [ ] Add platform-specific networking integration
-* [ ] Publish the first usable release
-* [ ] Reach the legendary networking milestone: **it just works**
+Riekko keeps its state model intentionally small.
 
-## 💻 Platforms
+| State | Description |
+|---|---|
+| `IDLE` | No tunnel is active |
+| `STARTING` | Configuration is being checked and the tunnel is starting |
+| `CONNECTED` | The tunnel is active and routing traffic |
+| `RECONNECTING` | Riekko is attempting to recover the connection |
+| `ERROR` | The connection failed and needs attention |
 
-Platform support will depend on the networking backend and the maturity of the project.
+A status screen should answer the important questions immediately:
 
-| Platform | Status              |
-| -------- | ------------------- |
-| Windows  | Planned             |
-| Linux    | Planned             |
-| macOS    | Planned             |
-| Android  | Under consideration |
+```text
+RIEKKO
 
-The first stable target will be documented once the core implementation is ready.
+● CONNECTED
 
-## 🔧 Development
+Endpoint    nl.example.net
+Latency     31 ms
+Uptime      01:18:42
 
-Riekko is currently in early development.
+↑ 14.8 MB
+↓ 92.1 MB
+```
 
-The repository is expected to keep the networking core separate from platform-specific interfaces so that the tunnel logic can remain testable and reusable.
+No animated shield required.
+
+---
+
+## 🧩 Interface direction
+
+The interface is planned around a few focused areas instead of dozens of nested settings pages.
+
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>🌐 <strong>Connection</strong></td>
+<td>Current tunnel, endpoint, state and quick controls</td>
+</tr>
+<tr>
+<td>🗂️ <strong>Profiles</strong></td>
+<td>Saved and imported tunnel configurations</td>
+</tr>
+<tr>
+<td>📈 <strong>Session</strong></td>
+<td>Basic traffic and connection information</td>
+</tr>
+<tr>
+<td>⚙️ <strong>Preferences</strong></td>
+<td>Local application behavior</td>
+</tr>
+</tbody>
+</table>
+
+The goal is not to hide advanced configuration.
+
+The goal is to keep it **out of the main path until it is actually needed**.
+
+---
+
+## 🧭 Configuration philosophy
+
+Riekko should prefer configuration that is:
+
+- readable
+- portable
+- explicit
+- easy to validate
+- easy to debug
+
+Instead of burying everything in application state, a tunnel profile should remain understandable on its own.
+
+```text
+profile
+├── endpoint
+├── transport
+├── authentication
+├── routing
+└── optional overrides
+```
+
+The final schema is not stable yet.
+
+> [!IMPORTANT]
+> Configuration examples in early builds may change before the first stable release.
+
+---
+
+## 🛠️ Repository direction
+
+The project is expected to keep networking logic separate from the user-facing client.
 
 ```text
 riekko-tunnel/
-├── core/          # tunnel and networking logic
-├── client/        # application layer
-├── platform/      # OS-specific integration
-├── configs/       # examples and test configurations
-└── docs/          # documentation
+│
+├── core/          tunnel lifecycle and networking logic
+├── client/        application state and UI integration
+├── platform/      OS-specific networking code
+├── configs/       examples and test profiles
+├── tests/         integration and behavior tests
+└── docs/          technical documentation
 ```
 
-Development commands and build instructions will be added once the initial project structure is finalized.
+This keeps the core easier to test and avoids tying tunnel behavior directly to one interface.
+
+---
+
+## 🧪 Current status
+
+<div align="center">
+
+### **Early development**
+
+The architecture is still moving and compatibility is not guaranteed yet.
+
+</div>
+
+Things that may change:
+
+- configuration format
+- repository layout
+- UI structure
+- backend integration
+- supported platforms
+- command-line interface
+
+That is expected until the first stable release.
+
+---
+
+## 🗺️ Roadmap
+
+### Foundation
+
+- [ ] Define tunnel lifecycle
+- [ ] Define configuration schema
+- [ ] Add configuration validation
+- [ ] Add structured error reporting
+- [ ] Add logging and diagnostics
+
+### Client
+
+- [ ] Connection overview
+- [ ] Profile management
+- [ ] Import / export
+- [ ] Reconnect controls
+- [ ] Basic session statistics
+
+### Platform work
+
+- [ ] Windows integration
+- [ ] Linux integration
+- [ ] macOS integration
+- [ ] Evaluate Android support
+
+### Later
+
+- [ ] Stable configuration format
+- [ ] Automated tests for common network failures
+- [ ] Release packaging
+- [ ] Documentation
+- [ ] First stable release
+
+---
+
+## 🔧 Development
+
+Build instructions will be added once the initial implementation and toolchain are fixed.
+
+For now, the repository can be cloned normally:
 
 ```bash
-git clone https://github.com/<your-name>/riekko-tunnel.git
+git clone https://github.com/<owner>/riekko-tunnel.git
 cd riekko-tunnel
 ```
 
-## 🐦 Why Riekko?
+> [!TIP]
+> If you are working on the tunnel core, keep platform-specific behavior isolated whenever possible.
 
-**Riekko** is the Finnish name for the willow ptarmigan — a northern bird whose winter plumage blends almost completely into the snow.
-
-That fits the project surprisingly well.
-
-Riekko should be visible when you need to configure it, understandable when something goes wrong, and otherwise quiet enough to forget about.
-
-> **Connect. Route. Disappear into the background.**
+---
 
 ## 🤝 Contributing
 
-Riekko is still taking shape, so architecture discussions, bug reports and focused pull requests are welcome.
+Riekko is still small enough that architectural decisions matter.
 
-Good contributions should make the project:
+Issues and pull requests are welcome, especially when they make the project:
 
-* simpler to understand
-* easier to debug
-* more reliable
-* easier to maintain
-* less surprising
+- easier to understand
+- easier to test
+- easier to recover
+- less surprising
+- smaller without losing capability
 
-Large changes should preferably start as an issue before implementation.
+For large changes, opening an issue before writing the implementation is preferred.
+
+---
 
 ## 📜 License
 
 See [`LICENSE`](LICENSE).
 
-If third-party networking components are added, they remain covered by their respective licenses.
+Third-party components, when introduced, remain covered by their own licenses.
 
 ---
 
 <div align="center">
 
-### ❄️ Riekko
+## ❄️ Riekko
 
-**Quiet connection. Clear control.**
+**Connect quietly. Stay in control.**
 
 </div>
