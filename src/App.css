@@ -1,0 +1,37 @@
+.app-shell {
+  height: 100vh;
+  display: flex;
+  background: var(--md-surface);
+}
+
+.app-content {
+  flex: 1;
+  min-width: 0;
+  background: var(--md-surface);
+}
+
+.app-loading {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--md-surface);
+}
+
+.app-loading__brand {
+  font-size: 32px;
+  color: var(--md-primary);
+  animation: pulse 1.6s var(--motion-standard-curve) infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.4;
+    transform: scale(0.94);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.05);
+  }
+}

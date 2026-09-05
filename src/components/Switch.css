@@ -1,0 +1,51 @@
+.md-switch {
+  position: relative;
+  width: 52px;
+  height: 32px;
+  padding: 0;
+  border-radius: var(--shape-full);
+  border: 2px solid var(--md-outline);
+  background: var(--md-surface-container-highest);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition:
+    background var(--motion-standard) var(--motion-standard-curve),
+    border-color var(--motion-standard) var(--motion-standard-curve);
+}
+
+.md-switch:focus-visible {
+  outline: 2px solid var(--md-primary);
+  outline-offset: 2px;
+}
+
+.md-switch--checked {
+  background: var(--md-primary);
+  border-color: var(--md-primary);
+}
+
+.md-switch__thumb {
+  position: absolute;
+  top: 50%;
+  left: 6px;
+  width: 16px;
+  height: 16px;
+  border-radius: var(--shape-full);
+  background: var(--md-outline);
+  color: var(--md-on-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transform: translateY(-50%);
+  transition:
+    left var(--motion-standard) var(--motion-standard-curve),
+    width var(--motion-standard) var(--motion-standard-curve),
+    height var(--motion-standard) var(--motion-standard-curve),
+    background var(--motion-standard) var(--motion-standard-curve);
+}
+
+.md-switch--checked .md-switch__thumb {
+  left: 24px;
+  width: 24px;
+  height: 24px;
+  background: var(--md-on-primary);
+}

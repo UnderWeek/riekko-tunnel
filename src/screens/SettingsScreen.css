@@ -1,0 +1,31 @@
+.settings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 560px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 20px;
+}
+
+.settings-row__text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-row__title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--md-on-surface);
+}
+
+.settings-row__description {
+  font-size: 12px;
+  color: var(--md-on-surface-variant);
+}

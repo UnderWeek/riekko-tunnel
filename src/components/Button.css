@@ -1,0 +1,86 @@
+.md-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.1px;
+  transition:
+    background var(--motion-fast) var(--motion-standard-curve),
+    transform var(--motion-fast) var(--motion-standard-curve),
+    box-shadow var(--motion-fast) var(--motion-standard-curve);
+}
+
+.md-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.md-button:focus-visible {
+  outline: 2px solid var(--md-primary);
+  outline-offset: 2px;
+}
+
+.md-button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.md-button--filled {
+  height: 48px;
+  padding: 0 24px;
+  border-radius: var(--shape-full);
+  background: var(--md-primary);
+  color: var(--md-on-primary);
+  box-shadow: var(--elevation-1);
+}
+
+.md-button--filled:hover:not(:disabled) {
+  box-shadow: var(--elevation-2);
+  background: color-mix(in srgb, var(--md-primary) 92%, white);
+}
+
+.md-button--tonal {
+  height: 44px;
+  padding: 0 20px;
+  border-radius: var(--shape-full);
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+}
+
+.md-button--tonal:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--md-secondary-container) 85%, white);
+}
+
+.md-button--text {
+  height: 40px;
+  padding: 0 12px;
+  border-radius: var(--shape-full);
+  background: transparent;
+  color: var(--md-primary);
+}
+
+.md-button--text:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--md-primary) 12%, transparent);
+}
+
+.md-button--icon {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--shape-full);
+  background: transparent;
+  color: var(--md-on-surface-variant);
+}
+
+.md-button--icon:hover:not(:disabled) {
+  background: var(--md-surface-container-high);
+  color: var(--md-on-surface);
+}
+
+.md-button--danger.md-button--icon:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--md-error) 16%, transparent);
+  color: var(--md-error);
+}

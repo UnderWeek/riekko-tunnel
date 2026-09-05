@@ -1,0 +1,132 @@
+/* Material Design 3 — dark scheme (primary theme), icy-blue seed for Riekko.
+   Native system font stack: this is an offline-first desktop client, so
+   typography must not depend on a network font fetch, and Segoe UI reads
+   as native on the primary target platform, Windows. */
+
+:root {
+  --font-sans: "Segoe UI Variable", "Segoe UI", "SF Pro Text", system-ui, -apple-system, sans-serif;
+
+  --md-primary: #a9c7ff;
+  --md-on-primary: #00315e;
+  --md-primary-container: #16467f;
+  --md-on-primary-container: #d6e3ff;
+
+  --md-secondary: #bfc6dc;
+  --md-on-secondary: #29304a;
+  --md-secondary-container: #3f4762;
+  --md-on-secondary-container: #dbe2f9;
+
+  --md-tertiary: #ddbce0;
+  --md-on-tertiary: #3f2844;
+  --md-tertiary-container: #573e5c;
+  --md-on-tertiary-container: #fad7fc;
+
+  --md-error: #ffb4ab;
+  --md-on-error: #690005;
+  --md-error-container: #93000a;
+  --md-on-error-container: #ffdad6;
+  --md-success: #8fdb9a;
+  --md-success-container: #234d2c;
+
+  --md-surface-dim: #101418;
+  --md-surface: #12161b;
+  --md-surface-bright: #383c41;
+  --md-surface-container-lowest: #0b0f13;
+  --md-surface-container-low: #1a1e23;
+  --md-surface-container: #1e2227;
+  --md-surface-container-high: #282c31;
+  --md-surface-container-highest: #33373d;
+
+  --md-on-surface: #e2e2e6;
+  --md-on-surface-variant: #c2c7ce;
+  --md-outline: #8c9198;
+  --md-outline-variant: #42474d;
+
+  --md-scrim: rgba(0, 0, 0, 0.5);
+
+  --shape-xs: 8px;
+  --shape-sm: 12px;
+  --shape-md: 16px;
+  --shape-lg: 24px;
+  --shape-full: 999px;
+
+  --elevation-1: 0 1px 3px rgba(0, 0, 0, 0.35), 0 1px 2px rgba(0, 0, 0, 0.3);
+  --elevation-2: 0 3px 8px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.3);
+  --elevation-3: 0 8px 20px rgba(0, 0, 0, 0.45), 0 2px 4px rgba(0, 0, 0, 0.3);
+
+  --motion-fast: 120ms;
+  --motion-standard: 240ms;
+  --motion-slow: 400ms;
+  --motion-emphasized: cubic-bezier(0.3, 0, 0.1, 1);
+  --motion-standard-curve: cubic-bezier(0.2, 0, 0, 1);
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--md-surface);
+  color: var(--md-on-surface);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+button {
+  font-family: inherit;
+}
+
+::selection {
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+}
+
+/* Icons: real Material Symbols outline glyphs, recolored via currentColor */
+.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: currentColor;
+}
+
+.icon svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.icon svg path {
+  fill: currentColor;
+}
+
+/* Thin scrollbars that stay out of the way */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--md-surface-container-high);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}

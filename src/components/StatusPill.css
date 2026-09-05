@@ -1,0 +1,22 @@
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-radius: var(--shape-full);
+  background: color-mix(in srgb, var(--tint) 16%, transparent);
+  color: var(--tint);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  width: fit-content;
+  transition: background var(--motion-standard) var(--motion-standard-curve), color var(--motion-standard) var(--motion-standard-curve);
+}
+
+.status-pill__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--tint);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--tint) 22%, transparent);
+}

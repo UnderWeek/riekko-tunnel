@@ -1,0 +1,302 @@
+.import-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 10px 10px 16px;
+}
+
+.import-bar__icon {
+  color: var(--md-on-surface-variant);
+  flex-shrink: 0;
+}
+
+.import-bar__input {
+  flex: 1;
+  height: 40px;
+  border: none;
+  background: transparent;
+  color: var(--md-on-surface);
+  font-size: 14px;
+  font-family: inherit;
+}
+
+.import-bar__input:focus {
+  outline: none;
+}
+
+.import-bar__input::placeholder {
+  color: var(--md-on-surface-variant);
+}
+
+.import-message {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -10px 0 0;
+  font-size: 12px;
+}
+
+.import-message--error {
+  color: var(--md-error);
+}
+
+.import-message--success {
+  color: var(--md-success);
+}
+
+.create-group-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 8px 8px 16px;
+}
+
+.create-group-bar__input {
+  flex: 1;
+  height: 36px;
+  border: none;
+  background: transparent;
+  color: var(--md-on-surface);
+  font-size: 14px;
+  font-family: inherit;
+}
+
+.create-group-bar__input:focus {
+  outline: none;
+}
+
+.profiles-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.profile-group {
+  border-radius: var(--shape-lg);
+  transition: background var(--motion-standard) var(--motion-standard-curve);
+  padding: 6px;
+  margin: -6px;
+}
+
+.profile-group--drop-active {
+  background: color-mix(in srgb, var(--md-primary) 10%, transparent);
+}
+
+.profile-group__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 4px;
+}
+
+.profile-group__chevron {
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  border-radius: var(--shape-full);
+  color: var(--md-on-surface-variant);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition:
+    transform var(--motion-standard) var(--motion-standard-curve),
+    background var(--motion-fast) var(--motion-standard-curve);
+}
+
+.profile-group__chevron:hover {
+  background: var(--md-surface-container-high);
+}
+
+.profile-group__chevron--collapsed {
+  transform: rotate(-90deg);
+}
+
+.profile-group__name {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--md-on-surface-variant);
+  cursor: default;
+}
+
+.profile-group__rename-input {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--md-on-surface);
+  background: var(--md-surface-container-high);
+  border: 1px solid var(--md-primary);
+  border-radius: var(--shape-xs);
+  padding: 2px 8px;
+  font-family: inherit;
+}
+
+.profile-group__rename-input:focus {
+  outline: none;
+}
+
+.profile-group__count {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--md-on-surface-variant);
+  background: var(--md-surface-container-high);
+  border-radius: var(--shape-full);
+  padding: 1px 8px;
+}
+
+.profile-group__spacer {
+  flex: 1;
+}
+
+/* CSS-grid accordion: animating grid-template-rows gives a smooth
+   height transition without measuring the content in JS. */
+.profile-group__wrapper {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows var(--motion-slow) var(--motion-standard-curve);
+}
+
+.profile-group__wrapper--collapsed {
+  grid-template-rows: 0fr;
+}
+
+.profile-group__body {
+  overflow: hidden;
+  min-height: 0;
+}
+
+.profile-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 2px;
+  padding-bottom: 8px;
+}
+
+.profile-list__empty {
+  color: var(--md-on-surface-variant);
+  font-size: 13px;
+  padding: 4px 4px 12px;
+  border: 1px dashed var(--md-outline-variant);
+  border-radius: var(--shape-md);
+  text-align: center;
+  margin-top: 2px;
+}
+
+.profile-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 72px;
+  padding: 10px 8px 10px 8px;
+  border-radius: var(--shape-md);
+  background: var(--md-surface-container);
+  cursor: grab;
+  transition:
+    background var(--motion-fast) var(--motion-standard-curve),
+    opacity var(--motion-standard) var(--motion-standard-curve),
+    transform var(--motion-standard) var(--motion-standard-curve),
+    box-shadow var(--motion-standard) var(--motion-standard-curve);
+}
+
+.profile-row:hover {
+  background: var(--md-surface-container-high);
+}
+
+.profile-row:active {
+  cursor: grabbing;
+}
+
+.profile-row--selected {
+  background: var(--md-primary-container);
+}
+
+.profile-row--dragging {
+  opacity: 0.4;
+  transform: scale(0.97) rotate(-1deg);
+  box-shadow: var(--elevation-3);
+}
+
+.profile-row__grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--md-outline);
+  flex-shrink: 0;
+  width: 20px;
+}
+
+.profile-row__info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.profile-row__name-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.profile-row__name {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--md-on-surface);
+}
+
+.profile-row--selected .profile-row__name {
+  color: var(--md-on-primary-container);
+}
+
+.profile-row__meta {
+  font-size: 12px;
+  color: var(--md-on-surface-variant);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-row--selected .profile-row__meta {
+  color: color-mix(in srgb, var(--md-on-primary-container) 80%, transparent);
+}
+
+.profile-row__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--md-on-primary-container);
+  flex-shrink: 0;
+}
+
+.protocol-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: var(--shape-full);
+  flex-shrink: 0;
+}
+
+.protocol-badge--vless {
+  background: color-mix(in srgb, var(--md-primary) 20%, transparent);
+  color: var(--md-primary);
+}
+
+.protocol-badge--hysteria2 {
+  background: color-mix(in srgb, var(--md-tertiary) 20%, transparent);
+  color: var(--md-tertiary);
+}
+

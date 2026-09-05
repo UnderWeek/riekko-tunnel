@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Capability for the main window","local":true,"windows":["main"],"permissions":["core:default","opener:default",{"identifier":"shell:allow-execute","allow":[{"args":true,"name":"xray","sidecar":true},{"args":true,"name":"hysteria","sidecar":true}]}]}}
