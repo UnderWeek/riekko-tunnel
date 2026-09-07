@@ -9,9 +9,13 @@
 //! `NEPacketTunnelProvider`, what Shadowrocket uses) requires a paid Apple
 //! Developer certificate and a signed, notarized app plus an installed
 //! system-extension helper — none of which this project has. So, like every
-//! other unsigned cross-platform client (NekoBox, etc.), this asks for one
-//! administrator/root prompt to bring the tunnel up and one to tear it down.
-//! There's no way around that without the paid signing path.
+//! other unsigned cross-platform client (NekoBox, etc.), this needs one
+//! administrator/root prompt to bring the tunnel up. Disconnecting normally
+//! does *not* need a second prompt: the watchdog process spawned during
+//! that one elevation stays alive as root for the life of the tunnel, and
+//! `down()` just signals it (an unprivileged file write) to tear itself
+//! down. A second prompt only happens if that fast path fails for some
+//! reason (see `down()`'s fallback).
 //!
 //! Config recipe (device name, routes, split-default trick) follows
 //! tun2socks's own documented examples:
@@ -25,7 +29,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const TUN_DEVICE: &str = "utun123";
-const TUN_IP: &str = "198.18.0.1";
+// NOT 198.18.0.1 — that's the address every tun2socks example (and,
+// empirically, Shadowrocket) defaults to. Two TUN interfaces claiming the
+// identical point-to-point peer address makes the kernel's route resolution
+// ambiguous between them, so whichever fires up next can silently start
+// losing the route lookup. Staying in the same reserved benchmarking block
+// (RFC 2544, 198.18.0.0/15) but away from its very first address avoids
+// colliding with tools that use the obvious default.
+const TUN_IP: &str = "198.19.249.1";
 /// tun2socks's own `--restapi` HTTP server — its `/traffic` endpoint streams
 /// real, live up/down byte counters for everything passing through the TUN
 /// device, which is the actual source of truth now that TUN carries all
@@ -179,28 +190,109 @@ mod platform {
         Ok(())
     }
 
+    pub fn route_ok() -> bool {
+        let Ok(output) = Command::new("route").args(["-n", "get", "8.8.8.8"]).output() else {
+            return false;
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|l| l.trim().starts_with("gateway:") && l.contains(TUN_IP))
+    }
+
     pub fn up(socks_port: u16, server_host: &str) -> Result<TunHandle, String> {
         let tun2socks = sidecar_path("tun2socks")?;
         let (gateway, interface) = default_route()?;
         let server_ip = resolve_ipv4(server_host)?;
 
+        // macOS silently rewrites the routing table on network changes
+        // (Wi-Fi flapping, sleep/wake, DHCP renewal) without asking us —
+        // our manually-added routes just vanish and traffic quietly goes
+        // direct again. The watchdog below runs as root (inherited from
+        // this same elevated shell, so no extra password prompt) and
+        // re-asserts the routes whenever it notices they're gone.
+        //
+        // It also does double duty as the *disconnect* mechanism: since
+        // it's already root and already running continuously, it watches
+        // for a stop-signal file that `down()` can write as a completely
+        // unprivileged user, and does the full teardown itself when it
+        // sees one. That means disconnecting normally needs zero further
+        // admin prompts — only connecting does. It still exits on its own
+        // if tun2socks's pid disappears some other way.
+        //
+        // It's backgrounded as its own script file via `bash <file> &`
+        // rather than an inline `( ... ) &` subshell group — backgrounding
+        // a `( )` group turned out not to reliably detach under
+        // `do shell script`, leaving the loop running as the foreground
+        // body of the "up" script forever (so `osascript` — and the whole
+        // app, waiting on it — hung solid). A plain background command,
+        // the same shape already used successfully for tun2socks itself,
+        // does not have that problem.
+        let watchdog_script = format!(
+            r#"while true; do
+  TPID=$(cat /tmp/riekko-tun2socks.pid 2>/dev/null || echo "")
+  if [ -z "$TPID" ] || ! kill -0 "$TPID" 2>/dev/null; then
+    exit 0
+  fi
+  if [ -f /tmp/riekko-tun-stop ]; then
+    kill "$TPID" 2>/dev/null || true
+    route delete -host {server_ip} {gateway} >/dev/null 2>&1 || true
+    route delete -net 1.0.0.0/8 {ip} >/dev/null 2>&1 || true
+    route delete -net 2.0.0.0/7 {ip} >/dev/null 2>&1 || true
+    route delete -net 4.0.0.0/6 {ip} >/dev/null 2>&1 || true
+    route delete -net 8.0.0.0/5 {ip} >/dev/null 2>&1 || true
+    route delete -net 16.0.0.0/4 {ip} >/dev/null 2>&1 || true
+    route delete -net 32.0.0.0/3 {ip} >/dev/null 2>&1 || true
+    route delete -net 64.0.0.0/2 {ip} >/dev/null 2>&1 || true
+    route delete -net 128.0.0.0/1 {ip} >/dev/null 2>&1 || true
+    route delete -net 198.18.0.0/15 {ip} >/dev/null 2>&1 || true
+    rm -f /tmp/riekko-tun2socks.pid /tmp/riekko-tun2socks.log /tmp/riekko-tun-stop /tmp/riekko-tun-watchdog.pid /tmp/riekko-tun-watchdog-body.sh /tmp/riekko-tun-watchdog.log
+    exit 0
+  fi
+  CURRENT_GW=$(route -n get 8.8.8.8 2>/dev/null | awk '/gateway:/{{print $2}}')
+  if [ "$CURRENT_GW" != "{ip}" ]; then
+    route add -host {server_ip} {gateway} >/dev/null 2>&1 || true
+    route add -net 1.0.0.0/8 {ip} >/dev/null 2>&1 || true
+    route add -net 2.0.0.0/7 {ip} >/dev/null 2>&1 || true
+    route add -net 4.0.0.0/6 {ip} >/dev/null 2>&1 || true
+    route add -net 8.0.0.0/5 {ip} >/dev/null 2>&1 || true
+    route add -net 16.0.0.0/4 {ip} >/dev/null 2>&1 || true
+    route add -net 32.0.0.0/3 {ip} >/dev/null 2>&1 || true
+    route add -net 64.0.0.0/2 {ip} >/dev/null 2>&1 || true
+    route add -net 128.0.0.0/1 {ip} >/dev/null 2>&1 || true
+    route add -net 198.18.0.0/15 {ip} >/dev/null 2>&1 || true
+  fi
+  sleep 1
+done
+"#,
+            ip = TUN_IP,
+            server_ip = server_ip,
+            gateway = gateway,
+        );
+        let watchdog_path = std::env::temp_dir().join("riekko-tun-watchdog-body.sh");
+        std::fs::write(&watchdog_path, watchdog_script)
+            .map_err(|e| format!("Не удалось записать скрипт сторожа: {e}"))?;
+
         let script = format!(
             r#"set -e
+rm -f /tmp/riekko-tun-stop
 "{tun2socks}" --device {device} --proxy socks5://127.0.0.1:{port} --interface {iface} --restapi 127.0.0.1:{restapi} --loglevel silent > /tmp/riekko-tun2socks.log 2>&1 &
 disown
 echo $! > /tmp/riekko-tun2socks.pid
 sleep 1
 ifconfig {device} {ip} {ip} up
 route add -host {server_ip} {gateway} >/dev/null 2>&1 || true
-route add -net 1.0.0.0/8 {ip}
-route add -net 2.0.0.0/7 {ip}
-route add -net 4.0.0.0/6 {ip}
-route add -net 8.0.0.0/5 {ip}
-route add -net 16.0.0.0/4 {ip}
-route add -net 32.0.0.0/3 {ip}
-route add -net 64.0.0.0/2 {ip}
-route add -net 128.0.0.0/1 {ip}
-route add -net 198.18.0.0/15 {ip}
+route add -net 1.0.0.0/8 {ip} >/dev/null 2>&1 || true
+route add -net 2.0.0.0/7 {ip} >/dev/null 2>&1 || true
+route add -net 4.0.0.0/6 {ip} >/dev/null 2>&1 || true
+route add -net 8.0.0.0/5 {ip} >/dev/null 2>&1 || true
+route add -net 16.0.0.0/4 {ip} >/dev/null 2>&1 || true
+route add -net 32.0.0.0/3 {ip} >/dev/null 2>&1 || true
+route add -net 64.0.0.0/2 {ip} >/dev/null 2>&1 || true
+route add -net 128.0.0.0/1 {ip} >/dev/null 2>&1 || true
+route add -net 198.18.0.0/15 {ip} >/dev/null 2>&1 || true
+/bin/bash "{watchdog}" > /tmp/riekko-tun-watchdog.log 2>&1 &
+disown
+echo $! > /tmp/riekko-tun-watchdog.pid
 "#,
             tun2socks = tun2socks.display(),
             device = TUN_DEVICE,
@@ -210,6 +302,7 @@ route add -net 198.18.0.0/15 {ip}
             ip = TUN_IP,
             server_ip = server_ip,
             gateway = gateway,
+            watchdog = watchdog_path.display(),
         );
 
         run_elevated(&script, "up")?;
@@ -226,9 +319,11 @@ route add -net 198.18.0.0/15 {ip}
         })
     }
 
-    pub fn down(handle: &TunHandle) -> Result<(), String> {
-        let script = format!(
-            r#"PID=$(cat /tmp/riekko-tun2socks.pid 2>/dev/null || echo "")
+    fn elevated_teardown_script(handle: &TunHandle) -> String {
+        format!(
+            r#"WPID=$(cat /tmp/riekko-tun-watchdog.pid 2>/dev/null || echo "")
+if [ -n "$WPID" ]; then kill "$WPID" 2>/dev/null || true; fi
+PID=$(cat /tmp/riekko-tun2socks.pid 2>/dev/null || echo "")
 if [ -n "$PID" ]; then kill "$PID" 2>/dev/null || true; fi
 route delete -host {server_ip} {gateway} >/dev/null 2>&1 || true
 route delete -net 1.0.0.0/8 {ip} >/dev/null 2>&1 || true
@@ -240,13 +335,40 @@ route delete -net 32.0.0.0/3 {ip} >/dev/null 2>&1 || true
 route delete -net 64.0.0.0/2 {ip} >/dev/null 2>&1 || true
 route delete -net 128.0.0.0/1 {ip} >/dev/null 2>&1 || true
 route delete -net 198.18.0.0/15 {ip} >/dev/null 2>&1 || true
-rm -f /tmp/riekko-tun2socks.pid /tmp/riekko-tun2socks.log
+rm -f /tmp/riekko-tun2socks.pid /tmp/riekko-tun2socks.log /tmp/riekko-tun-stop /tmp/riekko-tun-watchdog.pid /tmp/riekko-tun-watchdog-body.sh /tmp/riekko-tun-watchdog.log
 "#,
             ip = TUN_IP,
             server_ip = handle.server_ip,
             gateway = handle.gateway,
-        );
-        run_elevated(&script, "down")
+        )
+    }
+
+    pub fn down(handle: &TunHandle) -> Result<(), String> {
+        // Fast, no-prompt path: the watchdog spawned in `up()` is already
+        // running as root. Signal it with a plain, unprivileged file write
+        // and let IT do the actual teardown — no second admin/Touch ID
+        // prompt needed for something as routine as disconnecting.
+        let stop_signal = std::env::temp_dir().join("riekko-tun-stop");
+        if std::fs::write(&stop_signal, "1").is_ok() {
+            for _ in 0..30 {
+                std::thread::sleep(Duration::from_millis(200));
+                let device_gone = !Command::new("ifconfig")
+                    .arg(TUN_DEVICE)
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                if device_gone {
+                    let _ = std::fs::remove_file(&stop_signal);
+                    return Ok(());
+                }
+            }
+        }
+
+        // Fallback: the watchdog didn't react in time (or was never
+        // running to begin with) — fall back to doing it ourselves, which
+        // does need one more admin prompt.
+        let _ = std::fs::remove_file(&stop_signal);
+        run_elevated(&elevated_teardown_script(handle), "down")
     }
 }
 
@@ -254,6 +376,20 @@ rm -f /tmp/riekko-tun2socks.pid /tmp/riekko-tun2socks.log
 mod platform {
     use super::*;
     use std::process::Command;
+
+    pub fn route_ok() -> bool {
+        let Ok(output) = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "(Find-NetRoute -RemoteIPAddress 8.8.8.8 | Select-Object -First 1 -ExpandProperty NextHop)",
+            ])
+            .output()
+        else {
+            return false;
+        };
+        String::from_utf8_lossy(&output.stdout).trim() == TUN_IP
+    }
 
     /// Best-effort: written from tun2socks's own documented Windows recipe,
     /// but not verified on real Windows hardware in this dev environment.
@@ -350,6 +486,17 @@ Get-Process tun2socks-* -ErrorAction SilentlyContinue | Stop-Process -Force
 mod platform {
     use super::*;
     use std::process::Command;
+
+    pub fn route_ok() -> bool {
+        let Ok(output) = Command::new("sh")
+            .arg("-c")
+            .arg("ip route get 8.8.8.8 2>/dev/null")
+            .output()
+        else {
+            return false;
+        };
+        String::from_utf8_lossy(&output.stdout).contains(TUN_IP)
+    }
 
     /// Best-effort: `pkexec` (PolicyKit) is the standard one-shot graphical
     /// privilege prompt on most desktop Linux distros; not verified here.
@@ -470,8 +617,19 @@ mod platform {
     pub fn down(_handle: &TunHandle) -> Result<(), String> {
         Ok(())
     }
+    pub fn route_ok() -> bool {
+        false
+    }
 }
 
 pub fn up(socks_port: u16, server_host: &str) -> Result<TunHandle, String> {
     platform::up(socks_port, server_host)
+}
+
+/// Cheap, read-only check (no privilege needed) that traffic to the open
+/// internet is actually still being routed through the TUN device — as
+/// opposed to trusting that it is just because nothing crashed. Call only
+/// while TUN mode is the active routing mode.
+pub fn is_healthy() -> bool {
+    platform::route_ok()
 }

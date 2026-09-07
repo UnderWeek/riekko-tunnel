@@ -146,6 +146,22 @@ pub fn tick_session(data: State<AppData>) -> AppState {
     // available in TUN mode, where it's actually seeing all the traffic.
     let tun_traffic = data.tun.lock().unwrap().as_ref().map(|h| h.traffic_bytes());
 
+    // macOS (and to a lesser extent other OSes) can silently drop our
+    // manually-added routes on a network change — the core stays alive and
+    // "Connected" would otherwise keep showing even though traffic is
+    // quietly going out unprotected again. This is a real, no-privilege
+    // check of whether the OS is actually still routing through the
+    // tunnel, not just an assumption that nothing crashed. A watchdog
+    // (spawned alongside tun2socks, see tun::up) is usually already
+    // re-adding the routes in the background, so a brief "Reconnecting"
+    // blip that heals itself a few ticks later is the expected, honest
+    // outcome — not an error.
+    let tun_mode_active = {
+        let app = data.state.lock().unwrap();
+        !core_died && app.state.is_active() && app.routing_mode == Some(RoutingMode::Tun)
+    };
+    let tun_unhealthy = tun_mode_active && !tun::is_healthy();
+
     let mut app = data.state.lock().unwrap();
     if core_died {
         app.state = TunnelState::Error;
@@ -155,6 +171,13 @@ pub fn tick_session(data: State<AppData>) -> AppState {
         if let Some((up, down)) = tun_traffic {
             app.session.tx_mb = up as f64 / 1_000_000.0;
             app.session.rx_mb = down as f64 / 1_000_000.0;
+        }
+        if tun_mode_active {
+            app.state = if tun_unhealthy {
+                TunnelState::Reconnecting
+            } else {
+                TunnelState::Connected
+            };
         }
     }
     app.clone()
