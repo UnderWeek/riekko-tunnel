@@ -243,12 +243,17 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
 
 .profile-row__name {
   font-size: 14px;
   font-weight: 700;
   color: var(--md-on-surface);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .profile-row--selected .profile-row__name {

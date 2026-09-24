@@ -10,8 +10,8 @@ export function formatMb(value: number): string {
   return `${value.toFixed(2)} MB`;
 }
 
-/** `mbPerSec` is a per-tick delta in MB (ticks are ~1s), shown as an
- * adaptive live speed reading (B/s, KB/s or MB/s). */
+/** `mbPerSec` is a speed in MB/s, shown as an adaptive live reading
+ * (B/s, KB/s or MB/s). */
 export function formatSpeed(mbPerSec: number): string {
   const bytesPerSec = Math.max(0, mbPerSec) * 1_000_000;
   if (bytesPerSec < 1_000) return `${bytesPerSec.toFixed(0)} B/s`;

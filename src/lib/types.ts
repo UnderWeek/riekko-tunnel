@@ -42,7 +42,12 @@ export interface AppState {
   routing_mode: RoutingMode | null;
   groups: Group[];
   profiles: Profile[];
+  /** The profile picked for the next connect. */
   active_profile_id: string;
+  /** The profile the running tunnel was started with, if any. */
+  connected_profile_id: string | null;
+  /** Why the last connect failed or the tunnel dropped. */
+  last_error: string | null;
   settings: Settings;
   session: SessionInfo;
 }

@@ -3,15 +3,5 @@
   "identifier": "default",
   "description": "Capability for the main window",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    "opener:default",
-    {
-      "identifier": "shell:allow-execute",
-      "allow": [
-        { "name": "xray", "sidecar": true, "args": true },
-        { "name": "hysteria", "sidecar": true, "args": true }
-      ]
-    }
-  ]
+  "permissions": ["core:default", "opener:default"]
 }

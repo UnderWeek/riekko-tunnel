@@ -5,20 +5,22 @@ import "./SettingsScreen.css";
 export function SettingsScreen({
   settings,
   onChange,
+  error,
 }: {
   settings: Settings;
   onChange: (key: keyof Settings, value: boolean) => void;
+  error: string | null;
 }) {
   const rows: { key: keyof Settings; title: string; description: string }[] = [
     {
       key: "auto_connect",
       title: "Автоподключение",
-      description: "Подключаться к последнему профилю при запуске",
+      description: "Подключаться к выбранному профилю при запуске",
     },
     {
       key: "start_with_system",
       title: "Запуск со стартом системы",
-      description: "Открывать Riekko при входе в Windows",
+      description: "Открывать Riekko при входе в систему",
     },
     {
       key: "notifications",
@@ -33,6 +35,8 @@ export function SettingsScreen({
         <h1 className="screen__title">Параметры</h1>
       </div>
 
+      {error && <p className="settings-error">{error}</p>}
+
       <div className="settings-list">
         {rows.map((row) => (
           <div key={row.key} className="settings-row card">
@@ -40,7 +44,11 @@ export function SettingsScreen({
               <span className="settings-row__title">{row.title}</span>
               <span className="settings-row__description">{row.description}</span>
             </div>
-            <Switch checked={settings[row.key]} onChange={(value) => onChange(row.key, value)} />
+            <Switch
+              checked={settings[row.key]}
+              label={row.title}
+              onChange={(value) => onChange(row.key, value)}
+            />
           </div>
         ))}
       </div>

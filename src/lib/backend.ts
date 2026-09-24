@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppState, ImportSubscriptionResult } from "./types";
+import type { AppState, ImportSubscriptionResult, Settings } from "./types";
 
 export const backend = {
   getState: () => invoke<AppState>("get_state"),
@@ -11,7 +11,8 @@ export const backend = {
   importSubscription: (url: string) =>
     invoke<ImportSubscriptionResult>("import_subscription", { url }),
   removeProfile: (id: string) => invoke<AppState>("remove_profile", { id }),
-  updateSetting: (key: string, value: boolean) => invoke<AppState>("update_setting", { key, value }),
+  updateSetting: (key: keyof Settings, value: boolean) =>
+    invoke<AppState>("update_setting", { key, value }),
   createGroup: (name: string) => invoke<AppState>("create_group", { name }),
   renameGroup: (id: string, name: string) => invoke<AppState>("rename_group", { id, name }),
   deleteGroup: (id: string) => invoke<AppState>("delete_group", { id }),

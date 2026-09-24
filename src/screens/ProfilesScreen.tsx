@@ -1,4 +1,4 @@
-import { useEffect, useState, type DragEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent } from "react";
 import type { Group, Profile, Protocol } from "../lib/types";
 import { UNGROUPED_ID } from "../lib/types";
 import { Button } from "../components/Button";
@@ -71,6 +71,9 @@ export function ProfilesScreen({
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  // Unmounting the focused rename input fires its onBlur (which commits);
+  // Escape must be able to say "don't".
+  const renameCancelled = useRef(false);
 
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dragOverGroupId, setDragOverGroupId] = useState<string | null>(null);
@@ -83,7 +86,8 @@ export function ProfilesScreen({
 
   async function submitLink() {
     const value = link.trim();
-    if (!value) return;
+    // Enter bypasses the disabled button, so guard here too.
+    if (!value || importing) return;
     setImporting(true);
     setImportError(null);
     setImportSuccess(null);
@@ -121,7 +125,20 @@ export function ProfilesScreen({
     });
   }
 
+  function startRename(group: GroupRow) {
+    renameCancelled.current = false;
+    setRenamingId(group.id);
+    setRenameValue(group.name);
+  }
+
+  function cancelRename() {
+    renameCancelled.current = true;
+    setRenamingId(null);
+  }
+
   function commitRename(group: GroupRow) {
+    if (renameCancelled.current) return;
+    renameCancelled.current = true; // Enter + the blur that follows = one rename
     const trimmed = renameValue.trim();
     if (trimmed && trimmed !== group.name) {
       onRenameGroup(group.id, trimmed);
@@ -151,6 +168,14 @@ export function ProfilesScreen({
     if (dragOverGroupId !== groupId) setDragOverGroupId(groupId);
   }
 
+  function handleGroupDragLeave(e: DragEvent<HTMLElement>, groupId: string) {
+    // dragleave also fires when moving onto a child; only clear the
+    // highlight when the pointer really left this group.
+    const next = e.relatedTarget as Node | null;
+    if (next && e.currentTarget.contains(next)) return;
+    if (dragOverGroupId === groupId) setDragOverGroupId(null);
+  }
+
   function handleGroupDrop(e: DragEvent<HTMLElement>, groupId: string) {
     e.preventDefault();
     const profileId = e.dataTransfer.getData("text/plain");
@@ -159,9 +184,11 @@ export function ProfilesScreen({
     if (profileId) onMoveProfile(profileId, groupId);
   }
 
+  const knownGroups = new Set(groups.map((g) => g.id));
   const profilesByGroup = new Map<string, Profile[]>();
   for (const profile of profiles) {
-    const key = profile.group_id || UNGROUPED_ID;
+    // A profile whose group is gone would otherwise not render anywhere.
+    const key = knownGroups.has(profile.group_id) ? profile.group_id : UNGROUPED_ID;
     const list = profilesByGroup.get(key) ?? [];
     list.push(profile);
     profilesByGroup.set(key, list);
@@ -256,6 +283,7 @@ export function ProfilesScreen({
               className={`profile-group${isDropActive ? " profile-group--drop-active" : ""}`}
               onDragEnter={(e) => handleGroupDragEnter(e, group.id)}
               onDragOver={(e) => handleGroupDragOver(e, group.id)}
+              onDragLeave={(e) => handleGroupDragLeave(e, group.id)}
               onDrop={(e) => handleGroupDrop(e, group.id)}
             >
               <div className="profile-group__header">
@@ -277,16 +305,14 @@ export function ProfilesScreen({
                     onBlur={() => commitRename(group)}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") commitRename(group);
-                      if (e.key === "Escape") setRenamingId(null);
+                      if (e.key === "Escape") cancelRename();
                     }}
                   />
                 ) : (
                   <span
                     className="profile-group__name"
                     onDoubleClick={() => {
-                      if (!group.editable) return;
-                      setRenamingId(group.id);
-                      setRenameValue(group.name);
+                      if (group.editable) startRename(group);
                     }}
                     title={group.editable ? "Двойной клик — переименовать" : undefined}
                   >
@@ -303,10 +329,7 @@ export function ProfilesScreen({
                       variant="icon"
                       title="Переименовать группу"
                       icon={<Icon name="edit" size={16} />}
-                      onClick={() => {
-                        setRenamingId(group.id);
-                        setRenameValue(group.name);
-                      }}
+                      onClick={() => startRename(group)}
                     />
                     <Button
                       variant="icon"
@@ -342,7 +365,9 @@ export function ProfilesScreen({
                             </span>
                             <div className="profile-row__info">
                               <div className="profile-row__name-line">
-                                <span className="profile-row__name">{profile.name}</span>
+                                <span className="profile-row__name" title={profile.name}>
+                                {profile.name}
+                              </span>
                                 <ProtocolBadge protocol={profile.protocol} />
                               </div>
                               <span className="profile-row__meta">

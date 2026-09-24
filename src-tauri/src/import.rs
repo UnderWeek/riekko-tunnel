@@ -1,19 +1,43 @@
-use crate::state::{Profile, UNGROUPED_ID};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use crate::state::{unique_id, Profile, UNGROUPED_ID};
+use base64::alphabet;
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+use base64::engine::DecodePaddingMode;
+use base64::Engine as _;
 use percent_encoding::percent_decode_str;
-use url::Url;
+use url::{Host, Url};
 
 /// Parses a single share link (`vless://...`, `hysteria2://...` / `hy2://...`)
 /// into a profile. Freshly imported single keys land in `Ungrouped`; the
 /// caller reassigns `group_id` afterwards for subscription imports.
-pub fn parse_uri(raw: &str, id_seed: u64) -> Result<Profile, String> {
+pub fn parse_uri(raw: &str) -> Result<Profile, String> {
     let trimmed = raw.trim();
-    let url = Url::parse(trimmed).map_err(|_| "Не удалось разобрать ссылку".to_string())?;
-
-    match url.scheme() {
-        "vless" => parse_vless(&url, trimmed, id_seed),
-        "hysteria2" | "hy2" => parse_hysteria2(&url, trimmed, id_seed),
-        other => Err(format!("Протокол \"{other}\" пока не поддерживается")),
+    match parse_connect_params(trimmed)? {
+        ConnectParams::Vless(p) => {
+            let url = Url::parse(trimmed).map_err(|_| "Не удалось разобрать ссылку".to_string())?;
+            Ok(Profile {
+                id: unique_id("profile"),
+                name: remark(&url, format!("VLESS {}", p.host)),
+                endpoint: join_host_port(&p.host, &p.port.to_string()),
+                transport: p.network.to_uppercase(),
+                protocol: "VLESS".into(),
+                group_id: UNGROUPED_ID.into(),
+                uri: Some(trimmed.to_string()),
+            })
+        }
+        ConnectParams::Hysteria2(p) => {
+            let (normalized, _) = split_port_spec(trimmed);
+            let url =
+                Url::parse(&normalized).map_err(|_| "Не удалось разобрать ссылку".to_string())?;
+            Ok(Profile {
+                id: unique_id("profile"),
+                name: remark(&url, format!("Hysteria2 {}", p.host)),
+                endpoint: join_host_port(&p.host, &p.port_spec),
+                transport: "UDP".into(),
+                protocol: "HYSTERIA2".into(),
+                group_id: UNGROUPED_ID.into(),
+                uri: Some(trimmed.to_string()),
+            })
+        }
     }
 }
 
@@ -21,109 +45,90 @@ fn decode(s: &str) -> String {
     percent_decode_str(s).decode_utf8_lossy().into_owned()
 }
 
-fn host_port(url: &Url) -> Result<(String, u16), String> {
-    let host = url
-        .host_str()
-        .ok_or_else(|| "В ссылке не указан хост".to_string())?;
-    let port = url
-        .port()
-        .ok_or_else(|| "В ссылке не указан порт".to_string())?;
-    Ok((host.to_string(), port))
+/// The bare host, without the `[...]` that `Url::host_str` keeps around
+/// IPv6 literals — Xray and the OS resolver both want the plain address.
+fn host_of(url: &Url) -> Result<String, String> {
+    match url.host() {
+        Some(Host::Domain(d)) if !d.is_empty() => Ok(decode(d)),
+        Some(Host::Ipv4(a)) => Ok(a.to_string()),
+        Some(Host::Ipv6(a)) => Ok(a.to_string()),
+        _ => Err("В ссылке не указан хост".to_string()),
+    }
+}
+
+/// `host:port`, bracketing IPv6 literals so the result stays parseable.
+pub fn join_host_port(host: &str, port: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn remark(url: &Url, fallback: String) -> String {
     match url.fragment() {
-        Some(f) if !f.is_empty() => decode(f),
+        Some(f) if !f.trim().is_empty() => decode(f).trim().to_string(),
         _ => fallback,
     }
 }
 
-fn transport_of(url: &Url, default: &str) -> String {
-    url.query_pairs()
-        .find(|(key, _)| key == "type")
-        .map(|(_, value)| value.to_uppercase())
-        .unwrap_or_else(|| default.to_string())
-}
-
-fn parse_vless(url: &Url, raw: &str, id_seed: u64) -> Result<Profile, String> {
-    if url.username().is_empty() {
-        return Err("В ссылке VLESS отсутствует UUID".to_string());
-    }
-    let (host, port) = host_port(url)?;
-    let endpoint = format!("{host}:{port}");
-    let name = remark(url, format!("VLESS {host}"));
-    let transport = transport_of(url, "TCP");
-
-    Ok(Profile {
-        id: format!("profile-{id_seed}"),
-        name,
-        endpoint,
-        transport,
-        protocol: "VLESS".into(),
-        group_id: UNGROUPED_ID.into(),
-        uri: Some(raw.to_string()),
-    })
-}
-
-fn parse_hysteria2(url: &Url, raw: &str, id_seed: u64) -> Result<Profile, String> {
-    if url.username().is_empty() && url.password().is_none() {
-        return Err("В ссылке Hysteria2 отсутствует пароль".to_string());
-    }
-    let (host, port) = host_port(url)?;
-    let endpoint = format!("{host}:{port}");
-    let name = remark(url, format!("Hysteria2 {host}"));
-
-    Ok(Profile {
-        id: format!("profile-{id_seed}"),
-        name,
-        endpoint,
-        transport: "UDP".into(),
-        protocol: "HYSTERIA2".into(),
-        group_id: UNGROUPED_ID.into(),
-        uri: Some(raw.to_string()),
-    })
+fn scheme_of(line: &str) -> Option<String> {
+    line.split_once("://").map(|(s, _)| s.to_ascii_lowercase())
 }
 
 fn is_supported_scheme(line: &str) -> bool {
-    line.starts_with("vless://") || line.starts_with("hysteria2://") || line.starts_with("hy2://")
+    matches!(
+        scheme_of(line).as_deref(),
+        Some("vless" | "hysteria2" | "hy2")
+    )
+}
+
+/// Subscription providers disagree on base64 flavor: padded or not,
+/// standard or URL-safe alphabet. Accept all of them.
+fn decode_base64_text(text: &str) -> Option<String> {
+    let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let config = GeneralPurposeConfig::new()
+        .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+        .with_decode_allow_trailing_bits(true);
+    [alphabet::STANDARD, alphabet::URL_SAFE]
+        .iter()
+        .find_map(|a| GeneralPurpose::new(a, config).decode(&cleaned).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+fn non_empty_lines(text: &str) -> Vec<String> {
+    text.trim_start_matches('\u{feff}')
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 /// Subscriptions are usually either a plain list of links (one per line) or
 /// the whole body base64-encoded down to a single blob. Try the plain form
 /// first since it's cheap to detect, fall back to base64.
 fn lines_from_body(body: &str) -> Vec<String> {
-    let plain: Vec<String> = body
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-
+    let plain = non_empty_lines(body);
     if plain.iter().any(|l| is_supported_scheme(l)) {
         return plain;
     }
-
-    let cleaned: String = body.chars().filter(|c| !c.is_whitespace()).collect();
-    if let Ok(bytes) = STANDARD.decode(&cleaned) {
-        if let Ok(decoded) = String::from_utf8(bytes) {
-            return decoded
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect();
-        }
+    match decode_base64_text(body.trim_start_matches('\u{feff}')) {
+        Some(decoded) => non_empty_lines(&decoded),
+        None => plain,
     }
-
-    plain
 }
 
 /// Parses every recognizable key out of a subscription body. Lines that
 /// don't parse (comments, unsupported protocols) are silently skipped —
 /// the caller reports how many profiles actually landed.
-pub fn parse_subscription_body(body: &str, id_seed_start: u64) -> Vec<Profile> {
+pub fn parse_subscription_body(body: &str) -> Vec<Profile> {
     lines_from_body(body)
         .into_iter()
-        .enumerate()
-        .filter_map(|(i, line)| parse_uri(&line, id_seed_start.wrapping_add(i as u64)).ok())
+        .filter(|line| is_supported_scheme(line))
+        .filter_map(|line| parse_uri(&line).ok())
         .collect()
 }
 
@@ -132,7 +137,7 @@ pub fn parse_subscription_body(body: &str, id_seed_start: u64) -> Vec<Profile> {
 pub fn group_name_from_url(url: &Url) -> String {
     let last_segment = url
         .path_segments()
-        .and_then(|segments| segments.filter(|s| !s.is_empty()).last())
+        .and_then(|mut segments| segments.rfind(|s| !s.is_empty()))
         .map(decode);
 
     match last_segment {
@@ -147,38 +152,72 @@ pub fn group_name_from_url(url: &Url) -> String {
 /// Full connection parameters for a VLESS outbound, matching the fields the
 /// Xray-core config format understands (https://xtls.github.io/config/outbounds/vless.html).
 pub struct VlessParams {
+    /// Server host as written in the link (domain or bare IP literal).
     pub host: String,
     pub port: u16,
     pub uuid: String,
+    /// VLESS `encryption` — "none" unless the server uses VLESS Encryption.
+    pub encryption: String,
     pub flow: Option<String>,
-    /// Transport: tcp/ws/grpc/...
+    /// Transport: raw/tcp, ws, grpc, httpupgrade, xhttp, ...
     pub network: String,
     /// none/tls/reality
     pub security: String,
     pub sni: Option<String>,
     pub fingerprint: Option<String>,
-    pub allow_insecure: bool,
+    pub alpn: Option<String>,
+    /// `pcs` — certificate pin, the Xray 26 replacement for `allowInsecure`.
+    pub pinned_cert_sha256: Option<String>,
     pub path: Option<String>,
     pub host_header: Option<String>,
     pub service_name: Option<String>,
+    /// `mode` — xhttp mode or `multi` for gRPC.
+    pub mode: Option<String>,
+    /// `headerType` — only `http` matters (TCP HTTP header obfuscation).
+    pub header_type: Option<String>,
     pub public_key: Option<String>,
     pub short_id: Option<String>,
+    pub spider_x: Option<String>,
 }
 
 /// Full connection parameters for a Hysteria2 client, matching the official
 /// client config (https://v2.hysteria.network/docs/getting-started/Client/).
 pub struct Hysteria2Params {
     pub host: String,
+    /// First (or only) server port — what a latency probe dials.
     pub port: u16,
+    /// Port as written in the link: `443`, or a port-hopping spec such as
+    /// `20000-50000` / `443,5000-6000` that the client understands natively.
+    pub port_spec: String,
     pub password: String,
     pub sni: Option<String>,
     pub insecure: bool,
-    pub obfs_password: Option<String>,
+    pub pin_sha256: Option<String>,
+    pub ech: Option<String>,
+    /// `(type, password)` — `salamander` or `gecko`.
+    pub obfs: Option<(String, String)>,
 }
 
+#[allow(clippy::large_enum_variant)] // built once per connect
 pub enum ConnectParams {
     Vless(VlessParams),
     Hysteria2(Hysteria2Params),
+}
+
+impl ConnectParams {
+    pub fn host(&self) -> &str {
+        match self {
+            ConnectParams::Vless(p) => &p.host,
+            ConnectParams::Hysteria2(p) => &p.host,
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        match self {
+            ConnectParams::Vless(p) => p.port,
+            ConnectParams::Hysteria2(p) => p.port,
+        }
+    }
 }
 
 /// Re-parses a stored share link into everything a real client core needs to
@@ -186,12 +225,21 @@ pub enum ConnectParams {
 /// used just for the list UI.
 pub fn parse_connect_params(raw: &str) -> Result<ConnectParams, String> {
     let trimmed = raw.trim();
-    let url = Url::parse(trimmed).map_err(|_| "Не удалось разобрать ссылку".to_string())?;
-
-    match url.scheme() {
-        "vless" => Ok(ConnectParams::Vless(parse_vless_full(&url)?)),
-        "hysteria2" | "hy2" => Ok(ConnectParams::Hysteria2(parse_hysteria2_full(&url)?)),
-        other => Err(format!("Протокол \"{other}\" пока не поддерживается")),
+    match scheme_of(trimmed).as_deref() {
+        Some("vless") => {
+            let url = Url::parse(trimmed).map_err(|_| "Не удалось разобрать ссылку".to_string())?;
+            Ok(ConnectParams::Vless(parse_vless_full(&url)?))
+        }
+        Some("hysteria2" | "hy2") => {
+            let (normalized, port_spec) = split_port_spec(trimmed);
+            let url =
+                Url::parse(&normalized).map_err(|_| "Не удалось разобрать ссылку".to_string())?;
+            Ok(ConnectParams::Hysteria2(parse_hysteria2_full(
+                &url, port_spec,
+            )?))
+        }
+        Some(other) => Err(format!("Протокол \"{other}\" пока не поддерживается")),
+        None => Err("Не удалось разобрать ссылку".to_string()),
     }
 }
 
@@ -206,62 +254,148 @@ fn parse_vless_full(url: &Url) -> Result<VlessParams, String> {
     if url.username().is_empty() {
         return Err("В ссылке VLESS отсутствует UUID".to_string());
     }
-    let (host, port) = host_port(url)?;
-    let network = query_get(url, "type").unwrap_or_else(|| "tcp".to_string());
-    let security = query_get(url, "security").unwrap_or_else(|| "none".to_string());
-    let allow_insecure = matches!(
-        query_get(url, "allowInsecure").as_deref(),
-        Some("1") | Some("true")
-    );
+    let host = host_of(url)?;
+    let port = url
+        .port()
+        .ok_or_else(|| "В ссылке не указан порт".to_string())?;
+    let network = match query_get(url, "type")
+        .map(|t| t.to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("tcp") | Some("raw") => "tcp".to_string(),
+        // Renamed upstream; Xray still accepts both, but only one settings key.
+        Some("splithttp") => "xhttp".to_string(),
+        Some(other) => other.to_string(),
+    };
+    let security = query_get(url, "security")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "none".to_string());
 
     Ok(VlessParams {
         host,
         port,
         uuid: decode(url.username()),
+        encryption: query_get(url, "encryption").unwrap_or_else(|| "none".to_string()),
         flow: query_get(url, "flow"),
         network,
         security,
-        sni: query_get(url, "sni"),
+        sni: query_get(url, "sni").or_else(|| query_get(url, "peer")),
         fingerprint: query_get(url, "fp"),
-        allow_insecure,
+        alpn: query_get(url, "alpn"),
+        pinned_cert_sha256: query_get(url, "pcs"),
         path: query_get(url, "path"),
         host_header: query_get(url, "host"),
         service_name: query_get(url, "serviceName"),
+        mode: query_get(url, "mode"),
+        header_type: query_get(url, "headerType"),
         public_key: query_get(url, "pbk"),
         short_id: query_get(url, "sid"),
+        spider_x: query_get(url, "spx"),
     })
 }
 
-fn parse_hysteria2_full(url: &Url) -> Result<Hysteria2Params, String> {
-    let password = if !url.username().is_empty() {
-        decode(url.username())
-    } else if let Some(pw) = url.password() {
-        decode(pw)
-    } else {
-        return Err("В ссылке Hysteria2 отсутствует пароль".to_string());
+/// Hysteria2 allows a port-hopping spec in place of a single port
+/// (`host:20000-50000`, `host:443,5000-6000`), which `Url` rejects as an
+/// invalid port. Swap it for its first port so the rest parses normally and
+/// hand the original spec back separately.
+fn split_port_spec(raw: &str) -> (String, Option<String>) {
+    let unchanged = || (raw.to_string(), None);
+    let Some(scheme_end) = raw.find("://") else {
+        return unchanged();
     };
-    let (host, port) = host_port(url)?;
-    let insecure = matches!(query_get(url, "insecure").as_deref(), Some("1") | Some("true"));
+    let authority_start = scheme_end + 3;
+    let rest = &raw[authority_start..];
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let hostport_start = authority.rfind('@').map(|i| i + 1).unwrap_or(0);
+    let hostport = &authority[hostport_start..];
+    let colon = match hostport.rfind(']') {
+        Some(bracket) => hostport[bracket..].find(':').map(|i| bracket + i),
+        None => hostport.rfind(':'),
+    };
+    let Some(colon) = colon else {
+        return unchanged();
+    };
+    let spec = &hostport[colon + 1..];
+    let is_hopping = spec.contains(['-', ','])
+        && spec
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '-' || c == ',');
+    let first: String = spec.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !is_hopping || first.is_empty() {
+        return unchanged();
+    }
+    let spec_start = authority_start + hostport_start + colon + 1;
+    let rewritten = format!(
+        "{}{}{}",
+        &raw[..spec_start],
+        first,
+        &raw[spec_start + spec.len()..]
+    );
+    (rewritten, Some(spec.to_string()))
+}
+
+fn parse_hysteria2_full(url: &Url, port_spec: Option<String>) -> Result<Hysteria2Params, String> {
+    // The URI's userinfo *is* the auth string. With userpass auth it is
+    // written as `user:pass@`, and the server expects "user:pass" back.
+    let password = match (url.username(), url.password()) {
+        ("", None) => return Err("В ссылке Hysteria2 отсутствует пароль".to_string()),
+        (user, None) => decode(user),
+        (user, Some(pass)) => format!("{}:{}", decode(user), decode(pass)),
+    };
+    let host = host_of(url)?;
+    // The port is optional in Hysteria2 links and defaults to 443.
+    let port = url.port().unwrap_or(443);
+    // Same truthy spellings as the official client (Go's strconv.ParseBool).
+    let insecure = matches!(
+        query_get(url, "insecure").as_deref(),
+        Some("1" | "t" | "T" | "true" | "TRUE" | "True")
+    );
+    let obfs_password = query_get(url, "obfs-password");
+    let obfs = match query_get(url, "obfs").map(|t| t.to_ascii_lowercase()) {
+        // Older links carry just the password; salamander was the only kind.
+        None => obfs_password.map(|pw| ("salamander".to_string(), pw)),
+        Some(kind) if kind == "salamander" || kind == "gecko" => {
+            Some((kind, obfs_password.unwrap_or_default()))
+        }
+        Some(other) => return Err(format!("Обфускация \"{other}\" не поддерживается")),
+    };
 
     Ok(Hysteria2Params {
         host,
         port,
+        port_spec: port_spec.unwrap_or_else(|| port.to_string()),
         password,
         sni: query_get(url, "sni"),
         insecure,
-        obfs_password: query_get(url, "obfs-password"),
+        pin_sha256: query_get(url, "pinSHA256"),
+        ech: query_get(url, "ech"),
+        obfs,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+
+    fn vless(uri: &str) -> VlessParams {
+        match parse_connect_params(uri).unwrap() {
+            ConnectParams::Vless(p) => p,
+            _ => panic!("expected vless"),
+        }
+    }
+
+    fn hysteria2(uri: &str) -> Hysteria2Params {
+        match parse_connect_params(uri).unwrap() {
+            ConnectParams::Hysteria2(p) => p,
+            _ => panic!("expected hysteria2"),
+        }
+    }
 
     #[test]
     fn parses_vless_link() {
         let profile = parse_uri(
             "vless://b831381d-6324-4d53-ad4f-8cda48b30811@nl.example.net:443?type=ws&security=tls#My%20Server",
-            1,
         )
         .unwrap();
         assert_eq!(profile.protocol, "VLESS");
@@ -273,7 +407,7 @@ mod tests {
 
     #[test]
     fn parses_hysteria2_link_with_hy2_scheme() {
-        let profile = parse_uri("hy2://s3cr3t@de.example.net:8443?insecure=1#Berlin", 2).unwrap();
+        let profile = parse_uri("hy2://s3cr3t@de.example.net:8443?insecure=1#Berlin").unwrap();
         assert_eq!(profile.protocol, "HYSTERIA2");
         assert_eq!(profile.name, "Berlin");
         assert_eq!(profile.endpoint, "de.example.net:8443");
@@ -282,23 +416,35 @@ mod tests {
 
     #[test]
     fn falls_back_to_host_when_no_remark() {
-        let profile = parse_uri("vless://uuid@1.2.3.4:443", 3).unwrap();
+        let profile = parse_uri("vless://uuid@1.2.3.4:443").unwrap();
         assert_eq!(profile.name, "VLESS 1.2.3.4");
     }
 
     #[test]
     fn rejects_unsupported_scheme() {
-        assert!(parse_uri("ss://aes-256-gcm@1.2.3.4:8080#x", 4).is_err());
+        assert!(parse_uri("ss://aes-256-gcm@1.2.3.4:8080#x").is_err());
     }
 
     #[test]
     fn rejects_vless_without_uuid() {
-        assert!(parse_uri("vless://@nl.example.net:443", 5).is_err());
+        assert!(parse_uri("vless://@nl.example.net:443").is_err());
     }
 
     #[test]
-    fn rejects_missing_port() {
-        assert!(parse_uri("vless://uuid@nl.example.net", 6).is_err());
+    fn rejects_vless_missing_port() {
+        assert!(parse_uri("vless://uuid@nl.example.net").is_err());
+    }
+
+    #[test]
+    fn ids_are_unique_even_when_minted_back_to_back() {
+        let a = parse_uri("vless://uuid@a.example.net:443").unwrap();
+        let b = parse_uri("vless://uuid@a.example.net:443").unwrap();
+        assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn scheme_is_case_insensitive() {
+        assert!(parse_uri("VLESS://uuid@a.example.net:443#A").is_ok());
     }
 
     #[test]
@@ -322,28 +468,46 @@ mod tests {
     #[test]
     fn parses_plain_subscription_body() {
         let body = "vless://uuid@a.example.net:443#A\nhy2://pw@b.example.net:8443#B\n# comment\nnot-a-link";
-        let profiles = parse_subscription_body(body, 100);
-        assert_eq!(profiles.len(), 2);
+        assert_eq!(parse_subscription_body(body).len(), 2);
     }
 
     #[test]
-    fn parses_base64_subscription_body() {
-        let raw = "vless://uuid@a.example.net:443#A\nhy2://pw@b.example.net:8443#B";
-        let encoded = STANDARD.encode(raw);
-        let profiles = parse_subscription_body(&encoded, 200);
-        assert_eq!(profiles.len(), 2);
+    fn parses_plain_subscription_body_with_bom_and_crlf() {
+        let body = "\u{feff}vless://uuid@a.example.net:443#A\r\nhy2://pw@b.example.net:8443#B\r\n";
+        assert_eq!(parse_subscription_body(body).len(), 2);
+    }
+
+    #[test]
+    fn parses_base64_subscription_body_in_every_flavor() {
+        // Chosen so the encoding has both padding and URL-unsafe characters.
+        let raw =
+            "vless://uuid@a.example.net:443?path=%2F%3F%3E#A\nhy2://pw@b.example.net:8443#B??";
+        for encoded in [
+            STANDARD.encode(raw),
+            STANDARD_NO_PAD.encode(raw),
+            URL_SAFE_NO_PAD.encode(raw),
+        ] {
+            assert_eq!(parse_subscription_body(&encoded).len(), 2, "{encoded}");
+        }
+    }
+
+    #[test]
+    fn parses_base64_subscription_wrapped_over_lines() {
+        let encoded =
+            STANDARD.encode("vless://uuid@a.example.net:443#A\nhy2://pw@b.example.net:8443#B");
+        let wrapped: String = encoded
+            .as_bytes()
+            .chunks(20)
+            .map(|c| format!("{}\n", std::str::from_utf8(c).unwrap()))
+            .collect();
+        assert_eq!(parse_subscription_body(&wrapped).len(), 2);
     }
 
     #[test]
     fn parses_full_vless_reality_params() {
-        let params = match parse_connect_params(
-            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@nl.example.net:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=example.com&fp=chrome&pbk=abc123&sid=de&type=tcp#Reality",
-        )
-        .unwrap()
-        {
-            ConnectParams::Vless(p) => p,
-            _ => panic!("expected vless"),
-        };
+        let params = vless(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@nl.example.net:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=example.com&fp=chrome&pbk=abc123&sid=de&spx=%2F&type=tcp#Reality",
+        );
         assert_eq!(params.host, "nl.example.net");
         assert_eq!(params.port, 443);
         assert_eq!(params.uuid, "b831381d-6324-4d53-ad4f-8cda48b30811");
@@ -352,39 +516,108 @@ mod tests {
         assert_eq!(params.sni.as_deref(), Some("example.com"));
         assert_eq!(params.public_key.as_deref(), Some("abc123"));
         assert_eq!(params.short_id.as_deref(), Some("de"));
+        assert_eq!(params.spider_x.as_deref(), Some("/"));
+        assert_eq!(params.encryption, "none");
     }
 
     #[test]
     fn parses_full_vless_ws_tls_params() {
-        let params = match parse_connect_params(
-            "vless://uuid@nl.example.net:443?type=ws&security=tls&path=%2Fws&host=cdn.example.com#WS",
-        )
-        .unwrap()
-        {
-            ConnectParams::Vless(p) => p,
-            _ => panic!("expected vless"),
-        };
+        let params = vless(
+            "vless://uuid@nl.example.net:443?type=ws&security=tls&path=%2Fws&host=cdn.example.com&alpn=h2%2Chttp%2F1.1#WS",
+        );
         assert_eq!(params.network, "ws");
         assert_eq!(params.security, "tls");
         assert_eq!(params.path.as_deref(), Some("/ws"));
         assert_eq!(params.host_header.as_deref(), Some("cdn.example.com"));
+        assert_eq!(params.alpn.as_deref(), Some("h2,http/1.1"));
+    }
+
+    #[test]
+    fn vless_raw_and_splithttp_are_normalized() {
+        assert_eq!(
+            vless("vless://uuid@a.example.net:443?type=raw").network,
+            "tcp"
+        );
+        assert_eq!(
+            vless("vless://uuid@a.example.net:443?type=splithttp").network,
+            "xhttp"
+        );
+        assert_eq!(vless("vless://uuid@a.example.net:443").network, "tcp");
+    }
+
+    #[test]
+    fn ipv6_hosts_come_back_without_brackets() {
+        let params = vless("vless://uuid@[2001:db8::1]:443");
+        assert_eq!(params.host, "2001:db8::1");
+        let profile = parse_uri("vless://uuid@[2001:db8::1]:443").unwrap();
+        assert_eq!(profile.endpoint, "[2001:db8::1]:443");
     }
 
     #[test]
     fn parses_full_hysteria2_params() {
-        let params = match parse_connect_params(
-            "hysteria2://s3cr3t@de.example.net:8443?insecure=1&sni=example.com&obfs=salamander&obfs-password=hunter2#Berlin",
-        )
-        .unwrap()
-        {
-            ConnectParams::Hysteria2(p) => p,
-            _ => panic!("expected hysteria2"),
-        };
+        let params = hysteria2(
+            "hysteria2://s3cr3t@de.example.net:8443?insecure=1&sni=example.com&obfs=salamander&obfs-password=hunter2&pinSHA256=AB%3ACD#Berlin",
+        );
         assert_eq!(params.host, "de.example.net");
         assert_eq!(params.port, 8443);
+        assert_eq!(params.port_spec, "8443");
         assert_eq!(params.password, "s3cr3t");
         assert!(params.insecure);
         assert_eq!(params.sni.as_deref(), Some("example.com"));
-        assert_eq!(params.obfs_password.as_deref(), Some("hunter2"));
+        assert_eq!(
+            params.obfs,
+            Some(("salamander".to_string(), "hunter2".to_string()))
+        );
+        assert_eq!(params.pin_sha256.as_deref(), Some("AB:CD"));
+    }
+
+    #[test]
+    fn hysteria2_matches_official_client_quirks() {
+        // Go's ParseBool spellings.
+        assert!(hysteria2("hy2://pw@h.example.net:443?insecure=T").insecure);
+        assert!(!hysteria2("hy2://pw@h.example.net:443?insecure=0").insecure);
+        // Empty user + password: the official parser sends ":password".
+        assert_eq!(
+            hysteria2("hy2://:secret@h.example.net:443").password,
+            ":secret"
+        );
+        let gecko = hysteria2("hy2://pw@h.example.net:443?obfs=gecko&obfs-password=g&ech=AAAA");
+        assert_eq!(gecko.obfs, Some(("gecko".to_string(), "g".to_string())));
+        assert_eq!(gecko.ech.as_deref(), Some("AAAA"));
+    }
+
+    #[test]
+    fn hysteria2_userpass_auth_keeps_both_halves() {
+        assert_eq!(
+            hysteria2("hysteria2://user:pa%40ss@h.example.net:443").password,
+            "user:pa@ss"
+        );
+    }
+
+    #[test]
+    fn hysteria2_port_defaults_to_443() {
+        let params = hysteria2("hysteria2://pw@h.example.net/?sni=x");
+        assert_eq!(params.port, 443);
+        let profile = parse_uri("hysteria2://pw@h.example.net/?sni=x#A").unwrap();
+        assert_eq!(profile.endpoint, "h.example.net:443");
+    }
+
+    #[test]
+    fn hysteria2_port_hopping_spec_is_preserved() {
+        let params = hysteria2("hysteria2://pw@h.example.net:20000-50000/?sni=x#Hop");
+        assert_eq!(params.port, 20000);
+        assert_eq!(params.port_spec, "20000-50000");
+        let params = hysteria2("hy2://pw@[2001:db8::1]:443,5000-6000?insecure=1");
+        assert_eq!(params.host, "2001:db8::1");
+        assert_eq!(params.port, 443);
+        assert_eq!(params.port_spec, "443,5000-6000");
+        let profile = parse_uri("hysteria2://pw@h.example.net:20000-50000#Hop").unwrap();
+        assert_eq!(profile.endpoint, "h.example.net:20000-50000");
+        assert_eq!(profile.name, "Hop");
+    }
+
+    #[test]
+    fn hysteria2_rejects_unknown_obfs() {
+        assert!(parse_connect_params("hysteria2://pw@h.example.net:443?obfs=gfw").is_err());
     }
 }

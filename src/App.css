@@ -35,3 +35,11 @@
     transform: scale(1.05);
   }
 }
+
+.app-loading__error {
+  max-width: 420px;
+  padding: 0 24px;
+  text-align: center;
+  font-size: 14px;
+  color: var(--md-error);
+}

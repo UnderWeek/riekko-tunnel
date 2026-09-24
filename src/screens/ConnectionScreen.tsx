@@ -7,15 +7,32 @@ import "./ConnectionScreen.css";
 export function ConnectionScreen({
   appState,
   onToggleConnection,
+  toggling,
   error,
 }: {
   appState: AppState;
   onToggleConnection: () => void;
+  toggling: boolean;
   error: string | null;
 }) {
-  const { state, routing_mode, session, profiles, active_profile_id } = appState;
+  const { state, routing_mode, session, profiles, active_profile_id, connected_profile_id } = appState;
   const isConnected = state === "CONNECTED" || state === "RECONNECTING";
-  const activeProfile = profiles.find((p) => p.id === active_profile_id);
+  const isStarting = state === "STARTING";
+  const busy = toggling || isStarting;
+  const selectedProfile = profiles.find((p) => p.id === active_profile_id);
+  // While connected, show what the tunnel really uses — picking another
+  // profile only takes effect on the next connect.
+  const connectedProfile = connected_profile_id
+    ? profiles.find((p) => p.id === connected_profile_id)
+    : undefined;
+  const shownProfile = isConnected ? connectedProfile : selectedProfile;
+  const pendingSwitch =
+    isConnected && selectedProfile !== undefined && selectedProfile.id !== connected_profile_id;
+  // Byte counters come from tun2socks; the plain SOCKS proxy has none.
+  const hasTraffic = isConnected && routing_mode === "TUN";
+
+  let buttonLabel = isConnected ? "Отключить" : "Подключить";
+  if (busy) buttonLabel = isConnected ? "Отключение…" : "Подключение…";
 
   return (
     <div className="screen connection-screen">
@@ -38,11 +55,20 @@ export function ConnectionScreen({
         </div>
       </div>
 
-      {activeProfile ? (
-        <p className="connection-screen__profile-name">{activeProfile.name}</p>
+      {shownProfile ? (
+        <p className="connection-screen__profile-name">{shownProfile.name}</p>
+      ) : isConnected ? (
+        <p className="connection-screen__profile-name connection-screen__profile-name--muted">
+          Профиль удалён — туннель работает до отключения
+        </p>
       ) : (
         <p className="connection-screen__profile-name connection-screen__profile-name--muted">
           Профиль не выбран — откройте «Профили»
+        </p>
+      )}
+      {pendingSwitch && (
+        <p className="connection-screen__hint">
+          Выбран «{selectedProfile.name}» — переподключитесь, чтобы перейти на него
         </p>
       )}
 
@@ -66,13 +92,13 @@ export function ConnectionScreen({
           <span>
             <Icon name="upload" size={16} /> Отправлено
           </span>
-          <strong>{formatMb(session.tx_mb)}</strong>
+          <strong>{hasTraffic ? formatMb(session.tx_mb) : "—"}</strong>
         </div>
         <div className="connection-card__row">
           <span>
             <Icon name="download" size={16} /> Получено
           </span>
-          <strong>{formatMb(session.rx_mb)}</strong>
+          <strong>{hasTraffic ? formatMb(session.rx_mb) : "—"}</strong>
         </div>
       </div>
 
@@ -89,12 +115,12 @@ export function ConnectionScreen({
         type="button"
         className={`connect-button${isConnected ? " connect-button--active" : ""}`}
         onClick={onToggleConnection}
-        disabled={!activeProfile && !isConnected}
+        disabled={busy || (!selectedProfile && !isConnected)}
       >
         <span className="connect-button__icon">
           <Icon name="power" size={20} />
         </span>
-        {isConnected ? "Отключить" : "Подключить"}
+        {buttonLabel}
       </button>
     </div>
   );
