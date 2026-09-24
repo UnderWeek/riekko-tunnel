@@ -305,19 +305,49 @@ fn spawn_latency_probe(app: &AppHandle) {
 /// round-robin) and the core never has to resolve anything itself — in TUN
 /// mode its DNS query would be captured by the very tunnel it serves.
 fn resolve_server(host: &str, port: u16) -> Result<IpAddr, String> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(ip);
+    let ip = match host.parse::<IpAddr>() {
+        Ok(ip) => ip,
+        Err(_) => {
+            let addrs: Vec<SocketAddr> = (host, port)
+                .to_socket_addrs()
+                .map_err(|e| format!("Не удалось определить адрес сервера {host}: {e}"))?
+                .collect();
+            addrs
+                .iter()
+                .find(|a| a.is_ipv4())
+                .or_else(|| addrs.first())
+                .map(|a| a.ip())
+                .ok_or_else(|| format!("Не удалось определить адрес сервера {host}"))?
+        }
+    };
+    if !is_usable_server_ip(ip) {
+        return Err(format!(
+            "Сервер {host} указывает на {ip} — это не адрес в интернете. \
+             Похоже, домен заблокирован DNS-фильтром (Pi-hole, AdGuard, файл hosts)"
+        ));
     }
-    let addrs: Vec<SocketAddr> = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("Не удалось определить адрес сервера {host}: {e}"))?
-        .collect();
-    addrs
-        .iter()
-        .find(|a| a.is_ipv4())
-        .or_else(|| addrs.first())
-        .map(|a| a.ip())
-        .ok_or_else(|| format!("Не удалось определить адрес сервера {host}"))
+    Ok(ip)
+}
+
+/// Loopback, "any", multicast, broadcast and link-local answers are what DNS
+/// sinkholes hand out. Pinning one would route that address (even 127.0.0.1)
+/// via the LAN gateway for the whole session and still never connect.
+fn is_usable_server_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_link_local())
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+        }
+    }
 }
 
 #[tauri::command]
@@ -829,7 +859,26 @@ mod tests {
             resolve_server("2001:db8::1", 443).unwrap().to_string(),
             "2001:db8::1"
         );
-        assert!(resolve_server("localhost", 443).is_ok());
+        assert_eq!(
+            resolve_server("192.168.1.10", 443).unwrap().to_string(),
+            "192.168.1.10"
+        );
+    }
+
+    #[test]
+    fn resolve_server_rejects_dns_sinkhole_answers() {
+        for sinkhole in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "169.254.1.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "fe80::1",
+        ] {
+            assert!(resolve_server(sinkhole, 443).is_err(), "{sinkhole}");
+        }
+        assert!(resolve_server("localhost", 443).is_err());
     }
 
     #[test]

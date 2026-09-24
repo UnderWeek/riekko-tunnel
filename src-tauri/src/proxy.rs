@@ -314,7 +314,18 @@ mod platform {
         mode: String,
         host: String,
         port: String,
+        /// Per-scheme proxies: "manual" mode switches these on too, and
+        /// GIO/Chrome/Firefox prefer them over SOCKS — a stale corporate
+        /// proxy saved there would carry all web traffic instead of us.
+        #[serde(default)]
+        scheme_hosts: Vec<(String, String)>,
     }
+
+    const SCHEMES: [&str; 3] = [
+        "org.gnome.system.proxy.http",
+        "org.gnome.system.proxy.https",
+        "org.gnome.system.proxy.ftp",
+    ];
 
     fn gsettings(args: &[&str]) -> Result<String, String> {
         let output = sys::command("gsettings")
@@ -333,14 +344,24 @@ mod platform {
     pub fn snapshot() -> Result<Saved, String> {
         // Values are kept in GSettings' own text format ('none', 0, ...),
         // which `gsettings set` accepts back verbatim.
+        let mut scheme_hosts = Vec::new();
+        for schema in SCHEMES {
+            if let Ok(host) = gsettings(&["get", schema, "host"]) {
+                scheme_hosts.push((schema.to_string(), host));
+            }
+        }
         Ok(Saved {
             mode: gsettings(&["get", "org.gnome.system.proxy", "mode"])?,
             host: gsettings(&["get", "org.gnome.system.proxy.socks", "host"])?,
             port: gsettings(&["get", "org.gnome.system.proxy.socks", "port"])?,
+            scheme_hosts,
         })
     }
 
     pub fn enable(ports: LocalPorts) -> Result<(), String> {
+        for schema in SCHEMES {
+            gsettings(&["set", schema, "host", ""])?;
+        }
         gsettings(&["set", "org.gnome.system.proxy.socks", "host", "127.0.0.1"])?;
         gsettings(&[
             "set",
@@ -353,6 +374,9 @@ mod platform {
     }
 
     pub fn restore(saved: &Saved) {
+        for (schema, host) in &saved.scheme_hosts {
+            let _ = gsettings(&["set", schema, "host", host]);
+        }
         let _ = gsettings(&["set", "org.gnome.system.proxy.socks", "host", &saved.host]);
         let _ = gsettings(&["set", "org.gnome.system.proxy.socks", "port", &saved.port]);
         let _ = gsettings(&["set", "org.gnome.system.proxy", "mode", &saved.mode]);

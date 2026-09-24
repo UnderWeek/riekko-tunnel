@@ -92,9 +92,21 @@ pub enum TunStatus {
     Gone,
 }
 
+/// Per-session values baked into the privileged scripts.
+struct Session<'a> {
+    req: &'a TunRequest<'a>,
+    rest_port: u16,
+    /// Bearer token for tun2socks's REST API. It runs as root/admin and
+    /// would otherwise let any local process (or a web page probing
+    /// localhost ports) list and kill every connection.
+    rest_token: &'a str,
+}
+
 /// A running tunnel. Dropping it tears the tunnel down.
 pub struct TunHandle {
     work_dir: PathBuf,
+    /// Where the privileged side keeps its state (status, pids).
+    run_dir: PathBuf,
     stop_file: PathBuf,
     status_file: PathBuf,
     up_bytes: Arc<AtomicU64>,
@@ -160,7 +172,7 @@ impl TunHandle {
         let result = match self.stop_via_watchdog() {
             Ok(()) => Ok(()),
             Err(_) if !platform::needs_cleanup() => Ok(()),
-            Err(_) => platform::elevated_teardown(&self.work_dir),
+            Err(_) => platform::elevated_teardown(&self.run_dir, &self.work_dir),
         };
         let _ = std::fs::remove_file(&self.stop_file);
         if result.is_ok() {
@@ -181,10 +193,14 @@ impl TunHandle {
             return Err("watchdog is not running".into());
         }
         std::fs::write(&self.stop_file, b"stop").map_err(|e| e.to_string())?;
+        // The watchdog only ever *reads* the stop file (privileged code
+        // doesn't delete files in a user-writable folder); it acknowledges
+        // by writing its final status word once the teardown is done.
         let deadline = Instant::now() + STOP_ACK_TIMEOUT;
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
-            if !self.stop_file.exists() {
+            let word = read_status(&self.status_file).0;
+            if matches!(word.as_deref(), Some("stopped" | "dead")) || !self.stop_file.exists() {
                 return Ok(());
             }
         }
@@ -235,6 +251,7 @@ struct TrafficSample {
 /// handle is shut down.
 fn spawn_traffic_watcher(
     rest_port: u16,
+    rest_token: String,
     up_bytes: Arc<AtomicU64>,
     down_bytes: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
@@ -251,7 +268,7 @@ fn spawn_traffic_watcher(
         };
         let url = format!("http://127.0.0.1:{rest_port}/traffic");
         while !stop.load(Ordering::Relaxed) {
-            if let Ok(response) = client.get(&url).send().await {
+            if let Ok(response) = client.get(&url).bearer_auth(&rest_token).send().await {
                 let mut stream = response.bytes_stream();
                 let mut buf: Vec<u8> = Vec::new();
                 while let Some(Ok(chunk)) = stream.next().await {
@@ -300,15 +317,22 @@ pub fn up(req: TunRequest) -> Result<TunHandle, String> {
     let stop_file = req.work_dir.join("stop");
     let _ = std::fs::remove_file(&stop_file);
     let rest_port = crate::engine::free_port()?;
+    let rest_token = sys::random_token();
     let tun2socks = platform::tun2socks_path(req.work_dir)?;
 
-    platform::up(&req, &tun2socks, rest_port, &stop_file)?;
+    let session = Session {
+        req: &req,
+        rest_port,
+        rest_token: &rest_token,
+    };
+    let run_dir = platform::up(&session, &tun2socks, &stop_file)?;
 
     let up_bytes = Arc::new(AtomicU64::new(0));
     let down_bytes = Arc::new(AtomicU64::new(0));
     let watcher_stop = Arc::new(AtomicBool::new(false));
     spawn_traffic_watcher(
         rest_port,
+        rest_token.clone(),
         up_bytes.clone(),
         down_bytes.clone(),
         watcher_stop.clone(),
@@ -316,8 +340,9 @@ pub fn up(req: TunRequest) -> Result<TunHandle, String> {
 
     Ok(TunHandle {
         work_dir: req.work_dir.to_path_buf(),
+        status_file: run_dir.join("status"),
+        run_dir,
         stop_file,
-        status_file: platform::status_file(req.work_dir),
         up_bytes,
         down_bytes,
         watcher_stop,
@@ -353,6 +378,7 @@ TUN_IP=@@TUN_IP@@
 SERVER_IP=@@SERVER_IP@@
 SOCKS_PORT=@@SOCKS_PORT@@
 REST_PORT=@@REST_PORT@@
+REST_TOKEN=@@REST_TOKEN@@
 APP_PID=@@APP_PID@@
 CORE_PID=@@CORE_PID@@
 DETACH=@@DETACH@@
@@ -383,30 +409,39 @@ chown 0 "$RUN" 2>/dev/null; chmod 755 "$RUN"
 OLD_W=$(cat "$RUN/watchdog.pid" 2>/dev/null || true)
 if alive "$OLD_W" && cmd_of "$OLD_W" | grep -q 'riekko-tunnel/watchdog'; then kill "$OLD_W" 2>/dev/null || true; fi
 teardown
-rm -f "$STOP" "$RUN/watchdog.pid"
+rm -f "$RUN/watchdog.pid"
+device_free || fail "The TUN device $DEV is held by another process"
 if [ -n "$SERVER_IP" ]; then printf '%s\n' "$SERVER_IP" > "$RUN/server_ip"; fi
-$DETACH "$T2S" --device "$DEV" --proxy "socks5://127.0.0.1:$SOCKS_PORT" --restapi "127.0.0.1:$REST_PORT" --loglevel warning </dev/null >"$RUN/tun2socks.log" 2>&1 &
+$DETACH "$T2S" --device "$DEV" --proxy "socks5://127.0.0.1:$SOCKS_PORT" --restapi "$REST_TOKEN@127.0.0.1:$REST_PORT" --loglevel warning </dev/null >"$RUN/tun2socks.log" 2>&1 &
 echo $! > "$RUN/tun2socks.pid"
-device_up || fail "TUN device did not come up: $(tail -c 400 "$RUN/tun2socks.log" 2>/dev/null)"
+t2s_log() { tail -c 400 "$RUN/tun2socks.log" 2>/dev/null; }
+device_up || fail "TUN device did not come up: $(t2s_log)"
 routes_up || fail "Could not install routes"
 routes_ok || fail "Routes did not take effect"
+is_t2s "$(cat "$RUN/tun2socks.pid")" || fail "tun2socks exited: $(t2s_log)"
 cat > "$RUN/watchdog.sh" <<'RIEKKO_WATCHDOG_EOF'
 @@WATCHDOG@@
 RIEKKO_WATCHDOG_EOF
 set_status ok
-$DETACH nohup /bin/bash "$RUN/watchdog.sh" </dev/null >/dev/null 2>&1 &
+# No nohup: a non-interactive shell sends no SIGHUP to background jobs (and
+# the watchdog ignores it anyway), while macOS's nohup can refuse to run
+# outside a console session.
+$DETACH /bin/bash "$RUN/watchdog.sh" </dev/null >/dev/null 2>&1 &
 echo $! > "$RUN/watchdog.pid"
+sleep 0.3
+alive "$(cat "$RUN/watchdog.pid")" || fail "The watchdog did not start"
 exit 0
 "#;
 
 #[cfg(unix)]
 const UNIX_WATCHDOG: &str = r#"
+trap '' HUP
 echo $$ > "$RUN/watchdog.pid"
 finish() { teardown; set_status "$1"; rm -f "$RUN/watchdog.pid"; exit 0; }
 while :; do
-  if [ -e "$STOP" ]; then
-    teardown; set_status stopped; rm -f "$STOP" "$RUN/watchdog.pid"; exit 0
-  fi
+  # Only tested, never deleted: root doesn't remove files in a folder the
+  # user controls. "stopped" in the status file is the acknowledgement.
+  if [ -e "$STOP" ]; then finish stopped; fi
   if ! alive "$APP_PID" || ! cmd_of "$APP_PID" | grep -qi riekko; then
     if alive "$CORE_PID" && cmd_of "$CORE_PID" | grep -Eq 'xray|hysteria'; then kill "$CORE_PID" 2>/dev/null; fi
     finish stopped
@@ -423,7 +458,7 @@ const UNIX_TEARDOWN: &str = r#"
 W=$(cat "$RUN/watchdog.pid" 2>/dev/null || true)
 if alive "$W" && cmd_of "$W" | grep -q 'riekko-tunnel/watchdog'; then kill "$W" 2>/dev/null || true; fi
 teardown
-rm -f "$STOP" "$RUN/watchdog.pid"
+rm -f "$RUN/watchdog.pid"
 set_status stopped 2>/dev/null
 exit 0
 "#;
@@ -442,16 +477,17 @@ impl UnixScripts {
         tun2socks: &Path,
         device: &str,
         detach: &str,
-        req: Option<(&TunRequest, u16)>,
+        session: Option<&Session>,
     ) -> Self {
-        let (server_ip, socks_port, rest_port, core_pid) = match req {
-            Some((r, rest)) => (
-                r.server_ip.map(|ip| ip.to_string()).unwrap_or_default(),
-                r.socks_port,
-                rest,
-                r.core_pid,
+        let (server_ip, socks_port, rest_port, rest_token, core_pid) = match session {
+            Some(s) => (
+                s.req.server_ip.map(|ip| ip.to_string()).unwrap_or_default(),
+                s.req.socks_port,
+                s.rest_port,
+                s.rest_token.to_string(),
+                s.req.core_pid,
             ),
-            None => (String::new(), 0, 0, 0),
+            None => (String::new(), 0, 0, String::new(), 0),
         };
         let vars = [
             ("RUN", sys::sh_quote(run_dir)),
@@ -462,6 +498,7 @@ impl UnixScripts {
             ("SERVER_IP", sys::sh_quote(&server_ip)),
             ("SOCKS_PORT", socks_port.to_string()),
             ("REST_PORT", rest_port.to_string()),
+            ("REST_TOKEN", sys::sh_quote(&rest_token)),
             ("APP_PID", std::process::id().to_string()),
             (
                 "CORE_PID",
@@ -513,7 +550,9 @@ add_server_route() {
   else
     return 1
   fi
-  printf '%s\n' "$GW" > "$RUN/server_gw"
+  # Gateway *and* interface: undocking can move the default route to
+  # another interface that happens to use the same gateway address.
+  printf '%s %s\n' "$GW" "$IF" > "$RUN/server_gw"
 }
 add_nets() { for n in $NETS; do route -q -n add -net "$n" "$TUN_IP" >/dev/null 2>&1; done; return 0; }
 device_up() {
@@ -527,6 +566,22 @@ device_up() {
   ifconfig "$DEV" "$TUN_IP" "$TUN_IP" up
 }
 device_down() { :; }
+stale_t2s() {
+  # tun2socks processes (by executable, not by matching our own script's
+  # command line) still holding our device, e.g. from an older build.
+  ps -axo pid=,comm= 2>/dev/null | awk '$2 ~ /tun2socks$/ {print $1}' | while read -r p; do
+    if cmd_of "$p" | grep -q -- "--device $DEV"; then echo "$p"; fi
+  done
+}
+device_free() {
+  ifconfig "$DEV" >/dev/null 2>&1 || return 0
+  for p in $(stale_t2s); do kill "$p" 2>/dev/null; done
+  i=0
+  while ifconfig "$DEV" >/dev/null 2>&1; do
+    i=$((i+1)); [ "$i" -gt 30 ] && return 1
+    sleep 0.1
+  done
+}
 routes_up() { add_server_route || return 1; add_nets; }
 routes_down() {
   for n in $NETS; do route -q -n delete -net "$n" "$TUN_IP" >/dev/null 2>&1; done
@@ -538,24 +593,22 @@ routes_ok() { [ "$(route -n get 8.8.8.8 2>/dev/null | awk '/interface:/{print $2
 heal() {
   if [ -n "$SERVER_IP" ]; then
     SIF=$(route -n get "$SERVER_IP" 2>/dev/null | awk '/interface:/{print $2; exit}')
-    GW=$(default_gw)
-    OLD_GW=$(cat "$RUN/server_gw" 2>/dev/null || true)
-    if [ "$SIF" = "$DEV" ] || { [ -n "$GW" ] && [ "$GW" != "$OLD_GW" ]; }; then add_server_route; fi
+    NOW="$(default_gw) $(default_if)"
+    PINNED=$(cat "$RUN/server_gw" 2>/dev/null || true)
+    if [ "$SIF" = "$DEV" ] || { [ "$NOW" != " " ] && [ "$NOW" != "$PINNED" ]; }; then add_server_route; fi
   fi
   routes_ok || add_nets
 }
 "#;
 
-    pub fn status_file(_work_dir: &Path) -> PathBuf {
-        Path::new(RUN_DIR).join("status")
-    }
-
     pub fn tun2socks_path(_work_dir: &Path) -> Result<PathBuf, String> {
         sidecar_path("tun2socks")
     }
 
-    fn scripts(stop_file: &Path, tun2socks: &Path, req: Option<(&TunRequest, u16)>) -> UnixScripts {
-        UnixScripts::new(FUNCTIONS, RUN_DIR, stop_file, tun2socks, DEVICE, "", req)
+    fn scripts(stop_file: &Path, tun2socks: &Path, session: Option<&Session>) -> UnixScripts {
+        UnixScripts::new(
+            FUNCTIONS, RUN_DIR, stop_file, tun2socks, DEVICE, "", session,
+        )
     }
 
     /// Runs `script` as root behind the standard macOS admin prompt. The
@@ -588,16 +641,12 @@ heal() {
         )
     }
 
-    pub fn up(
-        req: &TunRequest,
-        tun2socks: &Path,
-        rest_port: u16,
-        stop_file: &Path,
-    ) -> Result<(), String> {
-        run_elevated(&scripts(stop_file, tun2socks, Some((req, rest_port))).up())
+    pub fn up(session: &Session, tun2socks: &Path, stop_file: &Path) -> Result<PathBuf, String> {
+        run_elevated(&scripts(stop_file, tun2socks, Some(session)).up())?;
+        Ok(PathBuf::from(RUN_DIR))
     }
 
-    pub fn elevated_teardown(work_dir: &Path) -> Result<(), String> {
+    pub fn elevated_teardown(_run_dir: &Path, work_dir: &Path) -> Result<(), String> {
         let t2s = PathBuf::from("tun2socks");
         run_elevated(&scripts(&work_dir.join("stop"), &t2s, None).teardown())
     }
@@ -626,10 +675,15 @@ heal() {
             core_pid: 4242,
             work_dir: Path::new("/tmp/riekko test's dir"),
         };
+        let session = Session {
+            req: &req,
+            rest_port: 9797,
+            rest_token: "0123abcd",
+        };
         let s = scripts(
             Path::new("/tmp/riekko test's dir/stop"),
             Path::new("/Applications/Riekko Tunnel.app/Contents/MacOS/tun2socks"),
-            Some((&req, 9797)),
+            Some(&session),
         );
         (s.up(), s.teardown())
     }
@@ -671,6 +725,7 @@ device_up() {
   ip addr replace "$TUN_IP/15" dev "$DEV" && ip link set dev "$DEV" up
 }
 device_down() { ip link del "$DEV" >/dev/null 2>&1; return 0; }
+device_free() { device_down; }
 routes_up() {
   if [ -n "$SERVER_IP" ]; then
     # Must be computed before the split routes exist, or it'd point at us.
@@ -699,10 +754,6 @@ heal() {
 }
 "#;
 
-    pub fn status_file(_work_dir: &Path) -> PathBuf {
-        Path::new(RUN_DIR).join("status")
-    }
-
     /// Inside an AppImage the bundled binaries live on a FUSE mount that
     /// root can't read, so root must be handed a copy outside it.
     pub fn tun2socks_path(work_dir: &Path) -> Result<PathBuf, String> {
@@ -720,11 +771,11 @@ heal() {
         Ok(copy)
     }
 
-    fn scripts(stop_file: &Path, tun2socks: &Path, req: Option<(&TunRequest, u16)>) -> UnixScripts {
+    fn scripts(stop_file: &Path, tun2socks: &Path, session: Option<&Session>) -> UnixScripts {
         // setsid: a Ctrl-C in the terminal the app was started from must
         // not reach root's tun2socks/watchdog and strand the routes.
         UnixScripts::new(
-            FUNCTIONS, RUN_DIR, stop_file, tun2socks, DEVICE, "setsid", req,
+            FUNCTIONS, RUN_DIR, stop_file, tun2socks, DEVICE, "setsid", session,
         )
     }
 
@@ -754,16 +805,12 @@ heal() {
         })
     }
 
-    pub fn up(
-        req: &TunRequest,
-        tun2socks: &Path,
-        rest_port: u16,
-        stop_file: &Path,
-    ) -> Result<(), String> {
-        run_elevated(&scripts(stop_file, tun2socks, Some((req, rest_port))).up())
+    pub fn up(session: &Session, tun2socks: &Path, stop_file: &Path) -> Result<PathBuf, String> {
+        run_elevated(&scripts(stop_file, tun2socks, Some(session)).up())?;
+        Ok(PathBuf::from(RUN_DIR))
     }
 
-    pub fn elevated_teardown(work_dir: &Path) -> Result<(), String> {
+    pub fn elevated_teardown(_run_dir: &Path, work_dir: &Path) -> Result<(), String> {
         let t2s = PathBuf::from("tun2socks");
         run_elevated(&scripts(&work_dir.join("stop"), &t2s, None).teardown())
     }
@@ -780,10 +827,15 @@ heal() {
             core_pid: 4242,
             work_dir: Path::new("/tmp/riekko test's dir"),
         };
+        let session = Session {
+            req: &req,
+            rest_port: 9797,
+            rest_token: "0123abcd",
+        };
         let s = scripts(
             Path::new("/tmp/riekko test's dir/stop"),
             Path::new("/opt/Riekko Tunnel/tun2socks"),
-            Some((&req, 9797)),
+            Some(&session),
         );
         (s.up(), s.teardown())
     }
@@ -795,21 +847,24 @@ heal() {
 
 /// Shared by the "up" script, the watchdog and the fallback teardown.
 #[cfg(any(windows, test))]
-const WIN_PRELUDE: &str = r#"$Dir = @@DIR@@
+const WIN_PRELUDE: &str = r#"$Run = @@RUN@@
+$Stop = @@STOP@@
 $T2S = @@T2S@@
-$Stop = Join-Path $Dir 'stop'
 $Dev = 'RiekkoTun'
 $TunIp = '@@TUN_IP@@'
 $ServerIp = @@SERVER_IP@@
 $Socks = @@SOCKS_PORT@@
 $Rest = @@REST_PORT@@
+$RestToken = @@REST_TOKEN@@
 $AppPid = @@APP_PID@@
+$AppName = @@APP_NAME@@
 $CorePid = @@CORE_PID@@
 
 function Set-Status([string]$s) {
   try {
-    [IO.File]::WriteAllText((Join-Path $Dir 'status.tmp'), $s)
-    Move-Item -LiteralPath (Join-Path $Dir 'status.tmp') -Destination (Join-Path $Dir 'status') -Force
+    $tmp = Join-Path $Run 'status.tmp'
+    [IO.File]::WriteAllText($tmp, $s)
+    Move-Item -LiteralPath $tmp -Destination (Join-Path $Run 'status') -Force
   } catch {}
 }
 
@@ -826,53 +881,80 @@ function Get-MainRoute {
 function Add-ServerRoute($main) {
   Remove-NetRoute -DestinationPrefix "$ServerIp/32" -PolicyStore ActiveStore -Confirm:$false -ErrorAction SilentlyContinue
   New-NetRoute -DestinationPrefix "$ServerIp/32" -InterfaceIndex $main.ifIndex -NextHop $main.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-  [IO.File]::WriteAllText((Join-Path $Dir 'server_route'), "$($main.ifIndex)|$($main.NextHop)")
 }
 
-function Teardown {
+function Read-First([string]$dir, [string]$name) {
+  $path = Join-Path $dir $name
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+  Get-Content -LiteralPath $path -ErrorAction SilentlyContinue | Select-Object -First 1
+}
+
+function Stop-Tunnel([string]$dir) {
   $ErrorActionPreference = 'SilentlyContinue'
-  $t = Get-Content -LiteralPath (Join-Path $Dir 'tun2socks.pid') | Select-Object -First 1
-  if ($t) {
-    Get-Process -Id ([int]$t) | Where-Object { $_.ProcessName -like 'tun2socks*' } | Stop-Process -Force
-  }
-  $old = Get-Content -LiteralPath (Join-Path $Dir 'server_ip') | Select-Object -First 1
+  $t = Read-First $dir 'tun2socks.pid'
+  if ($t) { Get-Process -Id ([int]$t) | Where-Object { $_.ProcessName -like 'tun2socks*' } | Stop-Process -Force }
+  $old = Read-First $dir 'server_ip'
   if ($old) { Remove-NetRoute -DestinationPrefix "$old/32" -PolicyStore ActiveStore -Confirm:$false }
   foreach ($prefix in @('0.0.0.0/1', '128.0.0.0/1')) {
     netsh interface ipv4 delete route $prefix $Dev store=active | Out-Null
   }
-  Remove-Item -LiteralPath (Join-Path $Dir 'tun2socks.pid'), (Join-Path $Dir 'server_ip'), (Join-Path $Dir 'server_route') -Force
+  Remove-Item -LiteralPath (Join-Path $dir 'tun2socks.pid'), (Join-Path $dir 'server_ip') -Force
+}
+
+function Stop-Watchdog([string]$dir) {
+  $ErrorActionPreference = 'SilentlyContinue'
+  $w = Read-First $dir 'watchdog.pid'
+  if ($w -and [int]$w -ne $PID) {
+    Get-Process -Id ([int]$w) | Where-Object { $_.ProcessName -eq 'powershell' } | Stop-Process -Force
+  }
 }
 "#;
 
 #[cfg(any(windows, test))]
 const WIN_UP: &str = r#"
 $ErrorActionPreference = 'Stop'
+$WatchdogCommand = '@@WATCHDOG@@'
 function Fail([string]$msg) {
-  [IO.File]::WriteAllText((Join-Path $Dir 'error.txt'), $msg)
-  Teardown
+  try { [IO.File]::WriteAllText((Join-Path $Run 'error.txt'), $msg) } catch {}
+  Stop-Tunnel $Run
   Set-Status 'dead'
   exit 1
 }
+
+# Everything the elevated side writes lives in a fresh directory with an
+# unpredictable name that only Administrators and SYSTEM can modify, so a
+# user-level process can't swap a file (or plant a junction) under it.
+try { New-Item -ItemType Directory -Path $Run -ErrorAction Stop | Out-Null } catch { exit 4 }
+icacls $Run /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+if ($LASTEXITCODE -ne 0) { exit 4 }
+
 try {
-  $oldW = Get-Content -LiteralPath (Join-Path $Dir 'watchdog.pid') -ErrorAction SilentlyContinue | Select-Object -First 1
-  if ($oldW) {
-    Get-Process -Id ([int]$oldW) -ErrorAction SilentlyContinue |
-      Where-Object { $_.ProcessName -eq 'powershell' } | Stop-Process -Force -ErrorAction SilentlyContinue
-  }
-  Teardown
-  Remove-Item -LiteralPath $Stop, (Join-Path $Dir 'error.txt'), (Join-Path $Dir 'watchdog.pid') -Force -ErrorAction SilentlyContinue
+  # Earlier sessions (normally long gone): stop whatever they left running,
+  # then delete their plain files only — never recursing, never following
+  # a reparse point.
+  $parent = Split-Path -Parent $Run
+  Get-ChildItem -LiteralPath $parent -Directory -Filter 'RiekkoTunnel-*' -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -ne $Run -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } |
+    ForEach-Object {
+      Stop-Watchdog $_.FullName
+      Stop-Tunnel $_.FullName
+      Get-ChildItem -LiteralPath $_.FullName -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+    }
 
   $main = $null
   if ($ServerIp) {
     $main = Get-MainRoute
     if (-not $main) { Fail 'No active default route to reach the server through' }
-    [IO.File]::WriteAllText((Join-Path $Dir 'server_ip'), $ServerIp)
+    [IO.File]::WriteAllText((Join-Path $Run 'server_ip'), $ServerIp)
   }
 
   $p = Start-Process -FilePath $T2S -WindowStyle Hidden -PassThru -ArgumentList @(
     '--device', $Dev, '--proxy', "socks5://127.0.0.1:$Socks",
-    '--restapi', "127.0.0.1:$Rest", '--loglevel', 'warning')
-  [IO.File]::WriteAllText((Join-Path $Dir 'tun2socks.pid'), [string]$p.Id)
+    '--restapi', "$RestToken@127.0.0.1:$Rest", '--loglevel', 'warning')
+  [IO.File]::WriteAllText((Join-Path $Run 'tun2socks.pid'), [string]$p.Id)
 
   $ready = $false
   for ($i = 0; $i -lt 100; $i++) {
@@ -891,9 +973,12 @@ try {
   }
 
   Set-Status 'ok'
-  $watchdog = '"' + (Join-Path $Dir 'watchdog.ps1') + '"'
-  Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @(
-    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $watchdog)
+  # Started from memory (-EncodedCommand), not from a script file the user
+  # could replace before the elevated process reads it.
+  $w = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru -ArgumentList @(
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
+    '-EncodedCommand', $WatchdogCommand)
+  [IO.File]::WriteAllText((Join-Path $Run 'watchdog.pid'), [string]$w.Id)
   exit 0
 } catch {
   Fail $_.Exception.Message
@@ -903,86 +988,139 @@ try {
 #[cfg(any(windows, test))]
 const WIN_WATCHDOG: &str = r#"
 $ErrorActionPreference = 'SilentlyContinue'
-[IO.File]::WriteAllText((Join-Path $Dir 'watchdog.pid'), [string]$PID)
-function Heal-ServerRoute {
-  $main = Get-MainRoute
-  if (-not $main) { return }
-  $have = Get-Content -LiteralPath (Join-Path $Dir 'server_route') | Select-Object -First 1
-  if ("$($main.ifIndex)|$($main.NextHop)" -ne $have) { try { Add-ServerRoute $main } catch {} }
+
+function Test-AppAlive {
+  # By name too: Windows reuses PIDs, and a recycled one must not keep a
+  # dead app's tunnel up.
+  $p = Get-Process -Id $AppPid
+  return [bool]($p -and (-not $AppName -or $p.ProcessName -eq $AppName))
 }
-$tick = 0
-while ($true) {
-  if (Test-Path -LiteralPath $Stop) {
-    Teardown; Set-Status 'stopped'
-    Remove-Item -LiteralPath $Stop, (Join-Path $Dir 'watchdog.pid') -Force
-    exit 0
+
+function Test-Tun2socksAlive {
+  $t = Read-First $Run 'tun2socks.pid'
+  if (-not $t) { return $false }
+  return [bool](Get-Process -Id ([int]$t) | Where-Object { $_.ProcessName -like 'tun2socks*' })
+}
+
+# Windows drops active-store routes of an interface that disconnects (sleep,
+# a Wi-Fi reconnect), even when it comes back with the same gateway. Without
+# the server's own /32 the core's traffic loops into the tunnel. Returns
+# whether everything was already in place.
+function Repair-Routes {
+  $ok = $true
+  if ($ServerIp) {
+    $main = Get-MainRoute
+    $pinned = @(Get-NetRoute -DestinationPrefix "$ServerIp/32" -PolicyStore ActiveStore)
+    $have = if ($pinned.Count) { "$($pinned[0].ifIndex)|$($pinned[0].NextHop)" } else { '' }
+    if ($main -and $have -ne "$($main.ifIndex)|$($main.NextHop)") {
+      try { Add-ServerRoute $main } catch {}
+      $ok = $false
+    }
+    if (-not @(Get-NetRoute -DestinationPrefix "$ServerIp/32" -PolicyStore ActiveStore).Count) { $ok = $false }
   }
-  if (-not (Get-Process -Id $AppPid)) {
+  foreach ($prefix in @('0.0.0.0/1', '128.0.0.0/1')) {
+    $routes = @(Get-NetRoute -DestinationPrefix $prefix -PolicyStore ActiveStore | Where-Object { $_.InterfaceAlias -eq $Dev })
+    if (-not $routes.Count) {
+      netsh interface ipv4 add route $prefix $Dev $TunIp metric=1 store=active | Out-Null
+      $ok = $false
+    }
+  }
+  return $ok
+}
+
+while ($true) {
+  # The stop file is only tested, never touched: "stopped" in the status
+  # file is the acknowledgement.
+  if (Test-Path -LiteralPath $Stop) { Stop-Tunnel $Run; Set-Status 'stopped'; exit 0 }
+  if (-not (Test-AppAlive)) {
     if ($CorePid) {
       Get-Process -Id $CorePid | Where-Object { $_.ProcessName -match '^(xray|hysteria)' } | Stop-Process -Force
     }
-    Teardown; Set-Status 'stopped'
-    Remove-Item -LiteralPath (Join-Path $Dir 'watchdog.pid') -Force
-    exit 0
+    Stop-Tunnel $Run; Set-Status 'stopped'; exit 0
   }
-  $t = Get-Content -LiteralPath (Join-Path $Dir 'tun2socks.pid') | Select-Object -First 1
-  if (-not $t -or -not (Get-Process -Id ([int]$t))) {
-    Teardown; Set-Status 'dead'
-    Remove-Item -LiteralPath (Join-Path $Dir 'watchdog.pid') -Force
-    exit 0
-  }
-  if ($ServerIp -and ($tick % 3) -eq 0) { Heal-ServerRoute }
-  $routes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/1' -PolicyStore ActiveStore | Where-Object { $_.InterfaceAlias -eq $Dev })
-  if ($routes.Count -gt 0) { Set-Status 'ok' } else { Set-Status 'degraded' }
-  $tick++
+  if (-not (Test-Tun2socksAlive)) { Stop-Tunnel $Run; Set-Status 'dead'; exit 0 }
+  if (Repair-Routes) { Set-Status 'ok' } else { Set-Status 'degraded' }
   Start-Sleep -Seconds 1
 }
 "#;
 
 #[cfg(any(windows, test))]
 const WIN_TEARDOWN: &str = r#"
-$w = Get-Content -LiteralPath (Join-Path $Dir 'watchdog.pid') -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($w) {
-  Get-Process -Id ([int]$w) -ErrorAction SilentlyContinue |
-    Where-Object { $_.ProcessName -eq 'powershell' } | Stop-Process -Force -ErrorAction SilentlyContinue
-}
-Teardown
-Remove-Item -LiteralPath $Stop, (Join-Path $Dir 'watchdog.pid') -Force -ErrorAction SilentlyContinue
+Stop-Watchdog $Run
+Stop-Tunnel $Run
 Set-Status 'stopped'
 exit 0
 "#;
 
-/// Renders the Windows scripts: `(up, watchdog, teardown)`.
+/// Renders the Windows scripts: `(up, teardown)`. The watchdog is embedded
+/// in `up` as an `-EncodedCommand` payload.
 #[cfg(any(windows, test))]
 fn windows_scripts(
-    work_dir: &Path,
+    run_dir: &Path,
+    stop_file: &Path,
     tun2socks: &Path,
-    req: Option<(&TunRequest, u16)>,
-) -> (String, String, String) {
-    let (server_ip, socks_port, rest_port, core_pid) = match req {
-        Some((r, rest)) => (
-            r.server_ip.map(|ip| ip.to_string()).unwrap_or_default(),
-            r.socks_port,
-            rest,
-            r.core_pid,
+    session: Option<&Session>,
+) -> (String, String) {
+    let (server_ip, socks_port, rest_port, rest_token, core_pid) = match session {
+        Some(s) => (
+            s.req.server_ip.map(|ip| ip.to_string()).unwrap_or_default(),
+            s.req.socks_port,
+            s.rest_port,
+            s.rest_token.to_string(),
+            s.req.core_pid,
         ),
-        None => (String::new(), 0, 0, 0),
+        None => (String::new(), 0, 0, String::new(), 0),
     };
+    let app_name = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_default();
     let vars = [
-        ("DIR", sys::ps_quote(&work_dir.to_string_lossy())),
+        ("RUN", sys::ps_quote(&run_dir.to_string_lossy())),
+        ("STOP", sys::ps_quote(&stop_file.to_string_lossy())),
         ("T2S", sys::ps_quote(&tun2socks.to_string_lossy())),
         ("TUN_IP", TUN_IP.to_string()),
         ("SERVER_IP", sys::ps_quote(&server_ip)),
         ("SOCKS_PORT", socks_port.to_string()),
         ("REST_PORT", rest_port.to_string()),
+        ("REST_TOKEN", sys::ps_quote(&rest_token)),
         ("APP_PID", std::process::id().to_string()),
+        ("APP_NAME", sys::ps_quote(&app_name)),
         ("CORE_PID", core_pid.to_string()),
     ];
     let prelude = sys::render(WIN_PRELUDE, &vars);
-    (
-        format!("{prelude}{WIN_UP}"),
-        format!("{prelude}{WIN_WATCHDOG}"),
-        format!("{prelude}{WIN_TEARDOWN}"),
+    let watchdog = sys::ps_encode(&format!("{prelude}{WIN_WATCHDOG}"));
+    let up = sys::render(WIN_UP, &[("WATCHDOG", watchdog)]);
+    (format!("{prelude}{up}"), format!("{prelude}{WIN_TEARDOWN}"))
+}
+
+/// The text a script file will hold (CRLF line endings, as Windows
+/// PowerShell expects) and its SHA-256 as uppercase hex — what the elevated
+/// bootstrap checks before running it.
+#[cfg(any(windows, test))]
+fn windows_script_text(script: &str) -> (String, String) {
+    use sha2::{Digest, Sha256};
+    let text = script.replace("\r\n", "\n").replace('\n', "\r\n");
+    let hash = Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect();
+    (text, hash)
+}
+
+/// The elevated entry point, passed as `-EncodedCommand`. It reads the
+/// script file once, refuses to run it unless it hashes to what the app
+/// wrote, and then runs exactly the text it checked — a same-user process
+/// swapping the file between write and elevation gets nowhere.
+#[cfg(any(windows, test))]
+fn windows_bootstrap(script_path: &Path, hash: &str) -> String {
+    format!(
+        "$c = [IO.File]::ReadAllText({path})\n\
+         $h = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($c))).Replace('-', '')\n\
+         if ($h -ne '{hash}') {{ exit 3 }}\n\
+         & ([scriptblock]::Create($c))\n\
+         exit $LASTEXITCODE\n",
+        path = sys::ps_quote(&script_path.to_string_lossy()),
     )
 }
 
@@ -993,32 +1131,40 @@ mod platform {
     const ADAPTER: &str = "RiekkoTun";
     /// ERROR_CANCELLED — the runner's exit code when UAC is declined.
     const UAC_CANCELLED: i32 = 1223;
+    const HASH_MISMATCH: i32 = 3;
+    const NO_RUN_DIR: i32 = 4;
 
-    pub fn status_file(work_dir: &Path) -> PathBuf {
-        work_dir.join("status")
+    fn program_data() -> PathBuf {
+        std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
     }
 
     pub fn tun2socks_path(_work_dir: &Path) -> Result<PathBuf, String> {
         sidecar_path("tun2socks")
     }
 
-    /// Windows PowerShell 5.1 reads BOM-less scripts in the ANSI code page,
-    /// which would mangle any non-ASCII path (a Cyrillic user name, say).
-    fn write_script(path: &Path, script: &str) -> Result<(), String> {
+    /// Writes the script with a UTF-8 BOM — Windows PowerShell 5.1 reads
+    /// BOM-less files in the ANSI code page, mangling non-ASCII paths (a
+    /// Cyrillic user name, say) — and returns its hash.
+    fn write_script(path: &Path, script: &str) -> Result<String, String> {
+        let (text, hash) = windows_script_text(script);
         let mut bytes = vec![0xEF, 0xBB, 0xBF];
-        bytes.extend_from_slice(script.replace('\n', "\r\n").as_bytes());
-        std::fs::write(path, bytes).map_err(|e| format!("Не удалось записать скрипт: {e}"))
+        bytes.extend_from_slice(text.as_bytes());
+        let _ = std::fs::remove_file(path);
+        crate::engine::write_private(path, &bytes)
+            .map_err(|e| format!("Не удалось записать скрипт: {e}"))?;
+        Ok(hash)
     }
 
-    /// Runs a script file elevated via UAC and waits for it. The runner is
-    /// passed as `-EncodedCommand`, and the script path is quoted for
-    /// `Start-Process`, which joins its argument list with bare spaces.
-    fn run_elevated(script_path: &Path) -> Result<(), String> {
-        let quoted_path = sys::ps_quote(&format!("\"{}\"", script_path.display()));
+    /// Runs a script file elevated via UAC (through the hash-checking
+    /// bootstrap) and waits for it.
+    fn run_elevated(script_path: &Path, hash: &str) -> Result<(), String> {
+        let bootstrap = sys::ps_encode(&windows_bootstrap(script_path, hash));
         let runner = format!(
             "try {{\n\
                $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -PassThru -ErrorAction Stop \
-                 -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',{quoted_path})\n\
+                 -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand','{bootstrap}')\n\
                $null = $p.Handle\n\
                $p.WaitForExit()\n\
                exit $p.ExitCode\n\
@@ -1038,58 +1184,55 @@ mod platform {
         match status.code() {
             Some(0) => Ok(()),
             Some(UAC_CANCELLED) => Err("Запрос UAC отклонён".to_string()),
+            Some(HASH_MISMATCH) => Err("скрипт TUN был изменён перед запуском".to_string()),
+            Some(NO_RUN_DIR) => Err("не удалось создать служебную папку в ProgramData".to_string()),
             _ => Err("сценарий завершился с ошибкой".to_string()),
         }
     }
 
-    pub fn up(
-        req: &TunRequest,
-        tun2socks: &Path,
-        rest_port: u16,
-        _stop_file: &Path,
-    ) -> Result<(), String> {
-        let (up, watchdog, _) = windows_scripts(req.work_dir, tun2socks, Some((req, rest_port)));
-        let up_path = req.work_dir.join("up.ps1");
-        let error_path = req.work_dir.join("error.txt");
-        let status_path = status_file(req.work_dir);
-        let _ = std::fs::remove_file(&error_path);
-        let _ = std::fs::remove_file(&status_path);
-        write_script(&up_path, &up)?;
-        write_script(&req.work_dir.join("watchdog.ps1"), &watchdog)?;
+    pub fn up(session: &Session, tun2socks: &Path, stop_file: &Path) -> Result<PathBuf, String> {
+        let run_dir = program_data().join(format!("RiekkoTunnel-{}", sys::random_token()));
+        let (up, _) = windows_scripts(&run_dir, stop_file, tun2socks, Some(session));
+        let up_path = session.req.work_dir.join("up.ps1");
+        let hash = write_script(&up_path, &up)?;
 
-        let result = run_elevated(&up_path);
+        let result = run_elevated(&up_path, &hash);
         let _ = std::fs::remove_file(&up_path);
         // The status file is the source of truth, not the exit code (which
         // `Start-Process -Verb RunAs` doesn't always relay): the elevated
         // script only writes "ok" once the adapter and routes are in place,
         // and from then on the watchdog owns the tunnel.
-        if matches!(read_status(&status_path), (Some(ref w), true) if w == "ok" || w == "degraded")
-        {
-            return Ok(());
+        let status = read_status(&run_dir.join("status"));
+        if matches!(status, (Some(ref w), true) if w == "ok" || w == "degraded") {
+            return Ok(run_dir);
         }
+        let detail = std::fs::read_to_string(run_dir.join("error.txt"))
+            .map(|s| s.trim_start_matches('\u{feff}').trim().to_string())
+            .unwrap_or_default();
         match result {
             Err(e) if e.contains("UAC") => Err(e),
-            _ => {
-                let detail = std::fs::read_to_string(&error_path)
-                    .map(|s| s.trim_start_matches('\u{feff}').trim().to_string())
-                    .unwrap_or_default();
-                Err(format!(
-                    "Настройка TUN не удалась: {}",
-                    if detail.is_empty() {
-                        "неизвестная ошибка".to_string()
-                    } else {
-                        detail
-                    }
-                ))
-            }
+            Err(e) if detail.is_empty() => Err(format!("Настройка TUN не удалась: {e}")),
+            _ => Err(format!(
+                "Настройка TUN не удалась: {}",
+                if detail.is_empty() {
+                    "неизвестная ошибка".to_string()
+                } else {
+                    detail
+                }
+            )),
         }
     }
 
-    pub fn elevated_teardown(work_dir: &Path) -> Result<(), String> {
-        let (_, _, teardown) = windows_scripts(work_dir, Path::new("tun2socks.exe"), None);
+    pub fn elevated_teardown(run_dir: &Path, work_dir: &Path) -> Result<(), String> {
+        let (_, teardown) = windows_scripts(
+            run_dir,
+            &work_dir.join("stop"),
+            Path::new("tun2socks.exe"),
+            None,
+        );
         let path = work_dir.join("down.ps1");
-        write_script(&path, &teardown)?;
-        let result = run_elevated(&path);
+        let hash = write_script(&path, &teardown)?;
+        let result = run_elevated(&path, &hash);
         let _ = std::fs::remove_file(&path);
         result
     }
@@ -1112,16 +1255,13 @@ mod platform {
 mod platform {
     use super::*;
 
-    pub fn status_file(work_dir: &Path) -> PathBuf {
-        work_dir.join("status")
-    }
     pub fn tun2socks_path(_work_dir: &Path) -> Result<PathBuf, String> {
         Err("TUN-режим не поддерживается на этой платформе".to_string())
     }
-    pub fn up(_req: &TunRequest, _t2s: &Path, _rest: u16, _stop: &Path) -> Result<(), String> {
+    pub fn up(_session: &Session, _t2s: &Path, _stop: &Path) -> Result<PathBuf, String> {
         Err("TUN-режим не поддерживается на этой платформе".to_string())
     }
-    pub fn elevated_teardown(_work_dir: &Path) -> Result<(), String> {
+    pub fn elevated_teardown(_run_dir: &Path, _work_dir: &Path) -> Result<(), String> {
         Ok(())
     }
     pub fn needs_cleanup() -> bool {
@@ -1136,6 +1276,7 @@ mod tests {
     fn handle_with_status(path: &Path) -> TunHandle {
         TunHandle {
             work_dir: std::env::temp_dir(),
+            run_dir: std::env::temp_dir(),
             stop_file: path.with_extension("stop"),
             status_file: path.to_path_buf(),
             up_bytes: Arc::new(AtomicU64::new(0)),
@@ -1183,27 +1324,63 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn windows_scripts_have_no_unfilled_placeholders() {
+    fn windows_test_scripts() -> (String, String, String) {
         let req = TunRequest {
             socks_port: 10808,
             server_ip: Some(Ipv4Addr::new(203, 0, 113, 7)),
             core_pid: 4242,
             work_dir: Path::new(r"C:\Users\O'Brien\AppData\Local\com.riekko.tunnel\tun"),
         };
-        let (up, watchdog, teardown) = windows_scripts(
-            req.work_dir,
+        let session = Session {
+            req: &req,
+            rest_port: 9797,
+            rest_token: "0123abcd",
+        };
+        let (up, teardown) = windows_scripts(
+            Path::new(r"C:\ProgramData\RiekkoTunnel-00ff"),
+            Path::new(r"C:\Users\O'Brien\AppData\Local\com.riekko.tunnel\tun\stop"),
             Path::new(r"C:\Program Files\Riekko Tunnel\tun2socks.exe"),
-            Some((&req, 9797)),
+            Some(&session),
         );
+        // Recover the watchdog from its -EncodedCommand payload.
+        let start = up.find("$WatchdogCommand = '").unwrap() + "$WatchdogCommand = '".len();
+        let end = up[start..].find('\'').unwrap() + start;
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&up[start..end])
+            .unwrap();
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        (up, String::from_utf16(&units).unwrap(), teardown)
+    }
+
+    #[test]
+    fn windows_scripts_have_no_unfilled_placeholders() {
+        let (up, watchdog, teardown) = windows_test_scripts();
         for script in [&up, &watchdog, &teardown] {
             assert!(!script.contains("@@"));
-            assert!(
-                script.contains(r"$Dir = 'C:\Users\O''Brien\AppData\Local\com.riekko.tunnel\tun'")
-            );
+            assert!(script.contains(r"$Run = 'C:\ProgramData\RiekkoTunnel-00ff'"));
+            assert!(script
+                .contains(r"$Stop = 'C:\Users\O''Brien\AppData\Local\com.riekko.tunnel\tun\stop'"));
         }
         assert!(up.contains("$ServerIp = '203.0.113.7'"));
+        assert!(up.contains(r#""$RestToken@127.0.0.1:$Rest""#));
         assert!(watchdog.contains("$CorePid = 4242"));
+        assert!(watchdog.contains("Repair-Routes"));
+    }
+
+    #[test]
+    fn windows_bootstrap_hash_matches_the_script_text() {
+        let (text, hash) = windows_script_text("Write-Host 'hi'\nexit 0\n");
+        assert_eq!(text, "Write-Host 'hi'\r\nexit 0\r\n");
+        assert_eq!(hash.len(), 64);
+        let bootstrap = windows_bootstrap(Path::new(r"C:\Users\O'Brien\up.ps1"), &hash);
+        assert!(bootstrap.contains(&format!("if ($h -ne '{hash}') {{ exit 3 }}")));
+        assert!(bootstrap.contains(r"ReadAllText('C:\Users\O''Brien\up.ps1')"));
+        // Idempotent on text that already has CRLF.
+        assert_eq!(windows_script_text(&text).1, hash);
     }
 
     /// Writes the rendered scripts out so CI (and a curious human) can run
@@ -1225,19 +1402,15 @@ mod tests {
             let end = up[start..].find("\nRIEKKO_WATCHDOG_EOF").unwrap() + start;
             std::fs::write(dir.join("watchdog.sh"), &up[start..end]).unwrap();
         }
-        let req = TunRequest {
-            socks_port: 10808,
-            server_ip: Some(Ipv4Addr::new(203, 0, 113, 7)),
-            core_pid: 4242,
-            work_dir: Path::new(r"C:\Users\O'Brien\AppData\Local\com.riekko.tunnel\tun"),
-        };
-        let (up, watchdog, teardown) = windows_scripts(
-            req.work_dir,
-            Path::new(r"C:\Program Files\Riekko\tun2socks.exe"),
-            Some((&req, 9797)),
-        );
+        let (up, watchdog, teardown) = windows_test_scripts();
         std::fs::write(dir.join("up.ps1"), up).unwrap();
         std::fs::write(dir.join("watchdog.ps1"), watchdog).unwrap();
         std::fs::write(dir.join("teardown.ps1"), teardown).unwrap();
+        let (text, hash) = windows_script_text("Write-Host 'bootstrapped'\nexit 5\n");
+        let script = dir.join("boot-target.ps1");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(text.as_bytes());
+        std::fs::write(&script, bytes).unwrap();
+        std::fs::write(dir.join("bootstrap.ps1"), windows_bootstrap(&script, &hash)).unwrap();
     }
 }

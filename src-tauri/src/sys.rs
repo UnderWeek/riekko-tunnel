@@ -52,6 +52,27 @@ pub fn ps_encode(script: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// An unguessable hex token (128 bits). Seeded from the OS through std's
+/// `RandomState` (random SipHash keys), so no RNG crate is needed.
+pub fn random_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    (0..2)
+        .map(|_| {
+            let mut h = RandomState::new().build_hasher();
+            h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+            h.write_u128(nanos);
+            format!("{:016x}", h.finish())
+        })
+        .collect()
+}
+
 /// Substitutes `@@NAME@@` placeholders — script templates are full of
 /// shell/PowerShell braces, which `format!` would force us to double.
 pub fn render(template: &str, vars: &[(&str, String)]) -> String {
@@ -82,6 +103,15 @@ mod tests {
             ps_quote("C:\\Users\\O\u{2019}Brien"),
             "'C:\\Users\\O\u{2019}\u{2019}Brien'"
         );
+    }
+
+    #[test]
+    fn random_tokens_are_long_and_distinct() {
+        let a = random_token();
+        let b = random_token();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
     }
 
     #[test]

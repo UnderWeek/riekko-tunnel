@@ -21,9 +21,11 @@ pub fn load(path: &Path) -> Result<Option<AppState>, LoadError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(LoadError::Unreadable(format!(
+        Err(e) => {
+            return Err(LoadError::Unreadable(format!(
             "Не удалось прочитать сохранённые профили ({e}); изменения в этом сеансе не сохранятся"
-        ))),
+        )))
+        }
     };
     match serde_json::from_slice::<PersistedState>(&bytes) {
         Ok(persisted) => Ok(Some(persisted.into_app())),
