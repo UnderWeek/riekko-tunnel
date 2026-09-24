@@ -86,6 +86,7 @@ mod tests {
         app.groups.push(Group {
             id: "g1".into(),
             name: "Work".into(),
+            source_url: None,
         });
         app.profiles.push(Profile {
             id: "p1".into(),

@@ -11,6 +11,8 @@ export const UNGROUPED_ID = "ungrouped";
 export interface Group {
   id: string;
   name: string;
+  /** Set for subscription groups: the URL they refresh from. */
+  source_url?: string;
 }
 
 export interface Profile {

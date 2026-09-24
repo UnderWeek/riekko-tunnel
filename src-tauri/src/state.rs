@@ -41,6 +41,10 @@ pub const UNGROUPED_ID: &str = "ungrouped";
 pub struct Group {
     pub id: String,
     pub name: String,
+    /// For a subscription group: the URL it was imported from. A refresh
+    /// finds its group by this, not by the (renamable, often generic) name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

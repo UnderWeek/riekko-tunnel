@@ -141,7 +141,18 @@ fn build_vless_config(p: &VlessParams, dial_host: &str, ports: LocalPorts) -> Va
         .clone()
         .or_else(|| p.host_header.clone())
         .unwrap_or_else(|| p.host.clone());
-    let http_host = p.host_header.clone().unwrap_or_else(|| p.host.clone());
+    // Host header: the link's `host`, else the TLS/REALITY server name (what
+    // Xray itself falls back to), and only then the address. A "clean IP"
+    // CDN link dials an IP, and a Host of 104.16.x.x gets rejected.
+    let http_host = p
+        .host_header
+        .clone()
+        .or_else(|| {
+            matches!(p.security.as_str(), "tls" | "reality")
+                .then(|| p.sni.clone())
+                .flatten()
+        })
+        .unwrap_or_else(|| p.host.clone());
     let path = p.path.clone().unwrap_or_else(|| "/".to_string());
 
     let mut stream_settings = json!({ "network": p.network });
@@ -163,6 +174,9 @@ fn build_vless_config(p: &VlessParams, dial_host: &str, ports: LocalPorts) -> Va
             }
             if let Some(pin) = &p.pinned_cert_sha256 {
                 tls["pinnedPeerCertSha256"] = json!(pin);
+            }
+            if let Some(name) = &p.verify_name {
+                tls["verifyPeerCertByName"] = json!(name);
             }
             stream_settings["security"] = json!("tls");
             stream_settings["tlsSettings"] = tls;
@@ -196,13 +210,27 @@ fn build_vless_config(p: &VlessParams, dial_host: &str, ports: LocalPorts) -> Va
             if let Some(mode) = &p.mode {
                 xhttp["mode"] = json!(mode);
             }
+            if let Some(extra) = &p.extra {
+                xhttp["extra"] = extra.clone();
+            }
             stream_settings["xhttpSettings"] = xhttp;
         }
         "grpc" => {
-            stream_settings["grpcSettings"] = json!({
+            let mut grpc = json!({
                 "serviceName": p.service_name.clone().unwrap_or_default(),
                 "multiMode": p.mode.as_deref() == Some("multi"),
             });
+            // Without TLS, Xray would otherwise use the dialed (pinned) IP as
+            // :authority, and a reverse proxy routes by it.
+            let is_domain = p.host.parse::<std::net::IpAddr>().is_err();
+            let authority = p
+                .authority
+                .clone()
+                .or_else(|| (p.security == "none" && is_domain).then(|| p.host.clone()));
+            if let Some(authority) = authority {
+                grpc["authority"] = json!(authority);
+            }
+            stream_settings["grpcSettings"] = grpc;
         }
         "tcp" if p.header_type.as_deref() == Some("http") => {
             stream_settings["tcpSettings"] = json!({
@@ -469,6 +497,41 @@ mod tests {
     }
 
     #[test]
+    fn host_header_prefers_sni_over_a_clean_ip() {
+        for net in ["ws", "httpupgrade", "xhttp"] {
+            let p = vless_params(&format!(
+                "vless://uuid@104.16.1.1:443?type={net}&security=tls&sni=real.example.com&path=%2Fp"
+            ));
+            let config = build_vless_config(&p, "104.16.1.1", PORTS);
+            let settings = format!("{net}Settings");
+            assert_eq!(
+                config["outbounds"][0]["streamSettings"][settings.as_str()]["host"],
+                "real.example.com",
+                "{net}"
+            );
+        }
+        // An explicit host still wins.
+        let p = vless_params(
+            "vless://uuid@104.16.1.1:443?type=ws&security=tls&sni=a.example.com&host=b.example.com",
+        );
+        let config = build_vless_config(&p, "104.16.1.1", PORTS);
+        assert_eq!(
+            config["outbounds"][0]["streamSettings"]["wsSettings"]["host"],
+            "b.example.com"
+        );
+    }
+
+    #[test]
+    fn grpc_authority_survives_ip_pinning() {
+        let p = vless_params("vless://uuid@grpc.example.com:80?type=grpc&serviceName=s");
+        let config = build_vless_config(&p, "203.0.113.7", PORTS);
+        assert_eq!(
+            config["outbounds"][0]["streamSettings"]["grpcSettings"]["authority"],
+            "grpc.example.com"
+        );
+    }
+
+    #[test]
     fn vless_sni_falls_back_to_link_host_for_ip_dial() {
         let p = vless_params("vless://uuid@nl.example.net:443?security=tls");
         let config = build_vless_config(&p, "203.0.113.7", PORTS);
@@ -591,6 +654,8 @@ mod tests {
             "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&allowInsecure=1&fp=chrome&alpn=h2,http/1.1#T",
             "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?type=ws&security=tls&path=%2Fws&host=cdn.example.com#T",
             "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?type=xhttp&security=tls&path=%2Fx&mode=auto#T",
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@104.16.1.1:443?type=xhttp&security=tls&sni=real.example.com&vcn=cert.example.com&mode=packet-up&extra=%7B%22xPaddingBytes%22%3A%222000-3000%22%7D#T",
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:80?type=grpc&serviceName=svc&authority=a.example.com#T",
             "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?type=splithttp&path=%2Fx#T",
             "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?type=httpupgrade&path=%2Fu&host=a.example.com#T",
             "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?type=grpc&serviceName=svc&mode=multi&security=tls#T",

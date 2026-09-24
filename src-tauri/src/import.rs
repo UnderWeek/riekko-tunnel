@@ -133,20 +133,58 @@ pub fn parse_subscription_body(body: &str) -> Vec<Profile> {
 }
 
 /// Derives a group name from a subscription URL's last path segment, minus
-/// its extension — `.../my-servers.txt` becomes `my-servers`.
+/// its extension — `.../my-servers.txt` becomes `my-servers`. Segments that
+/// every panel uses (`/api/v1/client/subscribe`, `/sub/<token>/v2ray`) or
+/// that are just an access token say nothing, so those fall back to the
+/// host name.
 pub fn group_name_from_url(url: &Url) -> String {
-    let last_segment = url
+    const GENERIC: [&str; 12] = [
+        "sub",
+        "subs",
+        "subscribe",
+        "subscription",
+        "link",
+        "links",
+        "v2ray",
+        "v2rayn",
+        "clash",
+        "singbox",
+        "sing-box",
+        "api",
+    ];
+    let host = || url.host_str().unwrap_or("Subscription").to_string();
+    let Some(raw_name) = url
         .path_segments()
         .and_then(|mut segments| segments.rfind(|s| !s.is_empty()))
-        .map(decode);
-
-    match last_segment {
-        Some(raw_name) => match raw_name.rsplit_once('.') {
-            Some((stem, _ext)) if !stem.is_empty() => stem.to_string(),
-            _ => raw_name,
-        },
-        None => url.host_str().unwrap_or("Subscription").to_string(),
+        .map(decode)
+    else {
+        return host();
+    };
+    let name = match raw_name.rsplit_once('.') {
+        Some((stem, _ext)) if !stem.is_empty() => stem.to_string(),
+        _ => raw_name,
+    };
+    let looks_like_token = name.len() >= 16
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if looks_like_token || GENERIC.contains(&name.to_ascii_lowercase().as_str()) {
+        host()
+    } else {
+        name
     }
+}
+
+/// Decodes a `profile-title` response header (Marzban, Remnawave, 3x-ui):
+/// either plain text or `base64:<...>`.
+pub fn decode_profile_title(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let title = match raw.strip_prefix("base64:") {
+        Some(encoded) => decode_base64_text(encoded)?,
+        None => raw.to_string(),
+    };
+    let title: String = title.trim().chars().take(64).collect();
+    (!title.is_empty()).then_some(title)
 }
 
 /// Full connection parameters for a VLESS outbound, matching the fields the
@@ -168,9 +206,17 @@ pub struct VlessParams {
     pub alpn: Option<String>,
     /// `pcs` — certificate pin, the Xray 26 replacement for `allowInsecure`.
     pub pinned_cert_sha256: Option<String>,
+    /// `vcn` — the name to verify the certificate against when it differs
+    /// from the SNI sent (the other Xray 26 replacement for `allowInsecure`).
+    pub verify_name: Option<String>,
     pub path: Option<String>,
     pub host_header: Option<String>,
     pub service_name: Option<String>,
+    /// gRPC `:authority`.
+    pub authority: Option<String>,
+    /// xhttp `extra` — padding, multiplexing and the like; a server with
+    /// custom settings rejects clients that don't send the same.
+    pub extra: Option<serde_json::Value>,
     /// `mode` — xhttp mode or `multi` for gRPC.
     pub mode: Option<String>,
     /// `headerType` — only `http` matters (TCP HTTP header obfuscation).
@@ -283,9 +329,14 @@ fn parse_vless_full(url: &Url) -> Result<VlessParams, String> {
         fingerprint: query_get(url, "fp"),
         alpn: query_get(url, "alpn"),
         pinned_cert_sha256: query_get(url, "pcs"),
+        verify_name: query_get(url, "vcn"),
         path: query_get(url, "path"),
         host_header: query_get(url, "host"),
         service_name: query_get(url, "serviceName"),
+        authority: query_get(url, "authority"),
+        extra: query_get(url, "extra")
+            .and_then(|e| serde_json::from_str::<serde_json::Value>(&e).ok())
+            .filter(|e| e.is_object()),
         mode: query_get(url, "mode"),
         header_type: query_get(url, "headerType"),
         public_key: query_get(url, "pbk"),
@@ -357,8 +408,22 @@ fn parse_hysteria2_full(url: &Url, port_spec: Option<String>) -> Result<Hysteria
         Some(kind) if kind == "salamander" || kind == "gecko" => {
             Some((kind, obfs_password.unwrap_or_default()))
         }
+        // The official client treats "plain" as no obfuscation.
+        Some(kind) if kind == "plain" => None,
         Some(other) => return Err(format!("Обфускация \"{other}\" не поддерживается")),
     };
+
+    // 3x-ui and v2rayN carry port hopping in `mport` (`20000-30000`, or
+    // with `:` as the range separator) rather than in the authority.
+    let port_spec = port_spec.or_else(|| {
+        query_get(url, "mport")
+            .map(|m| m.replace(':', "-"))
+            .filter(|m| {
+                m.chars()
+                    .all(|c| c.is_ascii_digit() || c == '-' || c == ',')
+            })
+            .filter(|m| m.chars().any(|c| c.is_ascii_digit()))
+    });
 
     Ok(Hysteria2Params {
         host,
@@ -614,6 +679,64 @@ mod tests {
         let profile = parse_uri("hysteria2://pw@h.example.net:20000-50000#Hop").unwrap();
         assert_eq!(profile.endpoint, "h.example.net:20000-50000");
         assert_eq!(profile.name, "Hop");
+    }
+
+    #[test]
+    fn hysteria2_panel_quirks() {
+        let plain = hysteria2("hy2://pw@h.example.net:443?obfs=plain");
+        assert!(plain.obfs.is_none());
+        let hop = hysteria2("hy2://pw@h.example.net:443?mport=20000:30000#M");
+        assert_eq!(hop.port, 443);
+        assert_eq!(hop.port_spec, "20000-30000");
+        let profile = parse_uri("hy2://pw@h.example.net:443?mport=20000-30000#M").unwrap();
+        assert_eq!(profile.endpoint, "h.example.net:20000-30000");
+    }
+
+    #[test]
+    fn vless_panel_params_are_kept() {
+        let p = vless(
+            "vless://uuid@104.16.1.1:443?type=xhttp&security=tls&sni=real.example.com&vcn=cert.example.com&extra=%7B%22xPaddingBytes%22%3A%222000-3000%22%7D#X",
+        );
+        assert_eq!(p.verify_name.as_deref(), Some("cert.example.com"));
+        assert_eq!(p.extra.unwrap()["xPaddingBytes"], "2000-3000");
+        let g = vless("vless://uuid@1.2.3.4:443?type=grpc&serviceName=s&authority=a.example.com");
+        assert_eq!(g.authority.as_deref(), Some("a.example.com"));
+        // Garbage `extra` is ignored rather than breaking the import.
+        assert!(vless("vless://uuid@1.2.3.4:443?type=xhttp&extra=nope")
+            .extra
+            .is_none());
+    }
+
+    #[test]
+    fn group_names_skip_generic_segments_and_tokens() {
+        let name = |u: &str| group_name_from_url(&Url::parse(u).unwrap());
+        assert_eq!(
+            name("https://provA.com/api/v1/client/subscribe?token=a"),
+            "provA.com".to_ascii_lowercase()
+        );
+        assert_eq!(
+            name("https://panel.example.net/sub/Zx8kQ2m9LpR4tV7wYb3N/v2ray"),
+            "panel.example.net"
+        );
+        assert_eq!(
+            name("https://panel.example.net/sub/Zx8kQ2m9LpR4tV7wYb3N"),
+            "panel.example.net"
+        );
+        assert_eq!(
+            name("https://raw.example.com/me/repo/main/work-servers.txt"),
+            "work-servers"
+        );
+    }
+
+    #[test]
+    fn profile_title_header_is_decoded() {
+        assert_eq!(decode_profile_title("My VPN").as_deref(), Some("My VPN"));
+        let b64 = STANDARD.encode("Мой VPN");
+        assert_eq!(
+            decode_profile_title(&format!("base64:{b64}")).as_deref(),
+            Some("Мой VPN")
+        );
+        assert_eq!(decode_profile_title("   "), None);
     }
 
     #[test]

@@ -690,6 +690,7 @@ pub fn create_group(name: String, data: State<AppData>) -> AppState {
     app.groups.push(Group {
         id: unique_id("group"),
         name: final_name,
+        source_url: None,
     });
     data.persist(&app);
     app.snapshot()
@@ -750,8 +751,9 @@ pub struct ImportSubscriptionResult {
 const MAX_SUBSCRIPTION_BYTES: usize = 2_000_000;
 
 /// Downloads a subscription with a hard timeout and size cap enforced while
-/// streaming — not after buffering an arbitrarily large body.
-async fn fetch_subscription(url: Url) -> Result<String, String> {
+/// streaming — not after buffering an arbitrarily large body. Returns the
+/// body and the provider's `profile-title`, if any.
+async fn fetch_subscription(url: Url) -> Result<(String, Option<String>), String> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
@@ -771,6 +773,11 @@ async fn fetch_subscription(url: Url) -> Result<String, String> {
     if response.content_length().unwrap_or(0) as usize > MAX_SUBSCRIPTION_BYTES {
         return Err("Файл подписки слишком большой".to_string());
     }
+    let title = response
+        .headers()
+        .get("profile-title")
+        .and_then(|v| v.to_str().ok())
+        .and_then(import::decode_profile_title);
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -780,7 +787,7 @@ async fn fetch_subscription(url: Url) -> Result<String, String> {
             return Err("Файл подписки слишком большой".to_string());
         }
     }
-    Ok(String::from_utf8_lossy(&body).into_owned())
+    Ok((String::from_utf8_lossy(&body).into_owned(), title))
 }
 
 #[tauri::command]
@@ -793,23 +800,33 @@ pub async fn import_subscription(
         return Err("Подписка должна начинаться с http:// или https://".to_string());
     }
 
-    let body = fetch_subscription(parsed.clone()).await?;
-    let group_name = import::group_name_from_url(&parsed);
+    let (body, title) = fetch_subscription(parsed.clone()).await?;
+    let source_url = parsed.to_string();
     let profiles = import::parse_subscription_body(&body);
     if profiles.is_empty() {
         return Err("В файле не найдено ни одного поддерживаемого ключа".to_string());
     }
 
     let mut app = data.state.lock().unwrap();
-    let group_id = if let Some(existing) = app.groups.iter().find(|g| g.name == group_name) {
-        existing.id.clone()
-    } else {
-        let id = unique_id("group");
-        app.groups.push(Group {
-            id: id.clone(),
-            name: group_name.clone(),
-        });
-        id
+    // Matched by URL: two providers' ".../subscribe" must not merge, and a
+    // group the user renamed must still be the one that gets refreshed.
+    let existing = app
+        .groups
+        .iter()
+        .find(|g| g.source_url.as_deref() == Some(source_url.as_str()))
+        .map(|g| (g.id.clone(), g.name.clone()));
+    let (group_id, group_name) = match existing {
+        Some(found) => found,
+        None => {
+            let id = unique_id("group");
+            let name = title.unwrap_or_else(|| import::group_name_from_url(&parsed));
+            app.groups.push(Group {
+                id: id.clone(),
+                name: name.clone(),
+                source_url: Some(source_url),
+            });
+            (id, name)
+        }
     };
 
     // Re-importing (refreshing) a subscription must not duplicate every key.
