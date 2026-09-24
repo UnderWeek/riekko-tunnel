@@ -13,12 +13,24 @@ use commands::{
     tick_session, toggle_connection, update_setting, AppData,
 };
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use tauri::Manager;
 use tauri_plugin_autostart::MacosLauncher;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        // Must come first. A second copy would share (and fight over) the
+        // saved library, the proxy crash marker and the TUN stop file —
+        // e.g. restore the proxy while the first copy still shows
+        // "connected". Launching again just brings the window back.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_autostart::init(
@@ -61,10 +73,19 @@ pub fn run() {
         match event {
             tauri::RunEvent::ExitRequested { api, .. } => {
                 let data = app_handle.state::<AppData>();
-                if data.has_routing() && !data.exiting.swap(true, Ordering::SeqCst) {
+                let needs_cleanup = data.has_routing() || data.is_busy();
+                if needs_cleanup && !data.exiting.swap(true, Ordering::SeqCst) {
                     api.prevent_exit();
                     let app_handle = app_handle.clone();
                     std::thread::spawn(move || {
+                        // Let a connect in progress (e.g. waiting on the
+                        // admin prompt) finish first, or it would install
+                        // routing right after we tore everything down.
+                        let data = app_handle.state::<AppData>();
+                        let deadline = Instant::now() + Duration::from_secs(120);
+                        while data.is_busy() && Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
                         commands::shutdown_all(&app_handle);
                         app_handle.exit(0);
                     });

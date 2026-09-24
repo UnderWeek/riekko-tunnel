@@ -20,14 +20,16 @@ export function ConnectionScreen({
   const isStarting = state === "STARTING";
   const busy = toggling || isStarting;
   const selectedProfile = profiles.find((p) => p.id === active_profile_id);
-  // While connected, show what the tunnel really uses — picking another
-  // profile only takes effect on the next connect.
+  // While connecting/connected, show what the tunnel really uses — picking
+  // another profile only takes effect on the next connect.
   const connectedProfile = connected_profile_id
     ? profiles.find((p) => p.id === connected_profile_id)
     : undefined;
-  const shownProfile = isConnected ? connectedProfile : selectedProfile;
+  const shownProfile = connected_profile_id ? connectedProfile : selectedProfile;
   const pendingSwitch =
-    isConnected && selectedProfile !== undefined && selectedProfile.id !== connected_profile_id;
+    connected_profile_id !== null &&
+    selectedProfile !== undefined &&
+    selectedProfile.id !== connected_profile_id;
   // Byte counters come from tun2socks; the plain SOCKS proxy has none.
   const hasTraffic = isConnected && routing_mode === "TUN";
 
@@ -57,7 +59,7 @@ export function ConnectionScreen({
 
       {shownProfile ? (
         <p className="connection-screen__profile-name">{shownProfile.name}</p>
-      ) : isConnected ? (
+      ) : connected_profile_id ? (
         <p className="connection-screen__profile-name connection-screen__profile-name--muted">
           Профиль удалён — туннель работает до отключения
         </p>
@@ -111,11 +113,17 @@ export function ConnectionScreen({
         </p>
       )}
 
+      {/* Busy is aria-disabled, not disabled: a disabled button drops
+          keyboard focus to <body>, and Space/Enter would stop working. */}
       <button
         type="button"
         className={`connect-button${isConnected ? " connect-button--active" : ""}`}
-        onClick={onToggleConnection}
-        disabled={busy || (!selectedProfile && !isConnected)}
+        onClick={() => {
+          if (!busy) onToggleConnection();
+        }}
+        aria-disabled={busy}
+        aria-busy={busy}
+        disabled={!busy && !selectedProfile && !isConnected}
       >
         <span className="connect-button__icon">
           <Icon name="power" size={20} />

@@ -23,53 +23,58 @@ export default function App() {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [toggling, setToggling] = useState(false);
 
-  // Every backend call answers with a full state snapshot, and answers can
-  // arrive out of order: a 1 s tick sent while a slow connect (admin prompt)
-  // is pending comes back first. Only a snapshot newer than the last one
-  // applied is used, so an old answer can never roll the UI back.
-  const issued = useRef(0);
-  const applied = useRef(0);
-  const track = useCallback(<T,>(request: Promise<T>, pick: (value: T) => AppState): Promise<T> => {
-    const seq = ++issued.current;
-    return request.then((value) => {
-      if (seq > applied.current) {
-        applied.current = seq;
-        setAppState(pick(value));
-      }
-      return value;
-    });
+  // Every backend answer is a full snapshot stamped with a revision taken
+  // under the backend's state lock. Answers arrive out of order — a 1 s
+  // tick sent during a slow connect/disconnect can come back before or
+  // after it — so a snapshot is applied only if it was *taken* later than
+  // the one on screen. (Ordering by when requests were sent would throw the
+  // toggle's own final answer away in favor of a mid-operation tick.)
+  const shownRevision = useRef(-1);
+  const apply = useCallback((next: AppState) => {
+    if (next.revision > shownRevision.current) {
+      shownRevision.current = next.revision;
+      setAppState(next);
+    }
   }, []);
+  const track = useCallback(
+    <T,>(request: Promise<T>, pick: (value: T) => AppState): Promise<T> =>
+      request.then((value) => {
+        apply(pick(value));
+        return value;
+      }),
+    [apply],
+  );
+  const refresh = useCallback(() => {
+    backend.getState().then(apply).catch(() => {});
+  }, [apply]);
 
   const togglingRef = useRef(false);
   const onToggleConnection = useCallback(() => {
-    // The button is disabled meanwhile, but a double click can land before
-    // React re-renders.
+    // The button ignores clicks meanwhile, but a double click can land
+    // before React re-renders.
     if (togglingRef.current) return;
     togglingRef.current = true;
     setToggling(true);
     setConnectionError(null);
     track(backend.toggleConnection(), same)
-      .catch((err) => setConnectionError(errorText(err, "Не удалось подключиться")))
+      .catch((err) => {
+        setConnectionError(errorText(err, "Не удалось подключиться"));
+        // A rejection carries no snapshot; pick up the ERROR state now.
+        refresh();
+      })
       .finally(() => {
         togglingRef.current = false;
         setToggling(false);
       });
-  }, [track]);
+  }, [track, refresh]);
 
-  const autoConnectTried = useRef(false);
   useEffect(() => {
-    track(backend.getState(), same)
-      .then((state) => {
-        // Guarded by a ref: StrictMode runs this effect twice in dev.
-        if (autoConnectTried.current) return;
-        autoConnectTried.current = true;
-        const hasProfile = state.profiles.some((p) => p.id === state.active_profile_id);
-        if (state.settings.auto_connect && hasProfile && state.state === "IDLE") {
-          onToggleConnection();
-        }
-      })
-      .catch((err) => setLoadError(errorText(err, "Не удалось загрузить состояние")));
-  }, [track, onToggleConnection]);
+    // Auto-connect happens in the backend at startup (once per launch, not
+    // once per page load), so this only needs to fetch the state.
+    track(backend.getState(), same).catch((err) =>
+      setLoadError(errorText(err, "Не удалось загрузить состояние")),
+    );
+  }, [track]);
 
   useEffect(() => {
     // Skip a tick while the previous one is still running instead of piling
@@ -86,6 +91,30 @@ export default function App() {
     }, 1000);
     return () => clearInterval(interval);
   }, [track]);
+
+  // A message from a previous attempt must not outlive the state it was
+  // about; once the state moves on, the backend's own `last_error` speaks.
+  const tunnelState = appState?.state;
+  useEffect(() => {
+    setConnectionError(null);
+  }, [tunnelState]);
+
+  useEffect(() => {
+    // With Tauri's native drag-drop handler off (so profile rows can be
+    // dragged), a file dropped anywhere outside a drop zone would make the
+    // WebView navigate to it — replacing the whole UI.
+    const block = (e: DragEvent) => {
+      if (e.defaultPrevented) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "none";
+    };
+    window.addEventListener("dragover", block);
+    window.addEventListener("drop", block);
+    return () => {
+      window.removeEventListener("dragover", block);
+      window.removeEventListener("drop", block);
+    };
+  }, []);
 
   const onRefreshSession = useCallback(() => {
     track(backend.refreshSession(), same).catch(() => {});
@@ -170,23 +199,32 @@ export default function App() {
     );
   }
 
+  // While idle or failed, the backend's own reason (a dropped tunnel, an
+  // unreadable profile file at startup) is the freshest explanation.
+  const showBackendError = appState.state === "ERROR" || appState.state === "IDLE";
+  const error = showBackendError ? (appState.last_error ?? connectionError) : connectionError;
+
+  // All screens stay mounted (just hidden), so an import running in the
+  // background, its result message, the traffic history and half-typed
+  // input survive switching tabs.
   return (
     <div className="app-shell">
       <NavigationRail section={section} onSelect={setSection} />
       <main className="app-content">
-        {section === "connection" && (
+        <div className="app-section" hidden={section !== "connection"}>
           <ConnectionScreen
             appState={appState}
             onToggleConnection={onToggleConnection}
             toggling={toggling}
-            error={connectionError ?? (appState.state === "ERROR" ? appState.last_error : null)}
+            error={error}
           />
-        )}
-        {section === "profiles" && (
+        </div>
+        <div className="app-section" hidden={section !== "profiles"}>
           <ProfilesScreen
             profiles={appState.profiles}
             groups={appState.groups}
             activeProfileId={appState.active_profile_id}
+            connectedProfileId={appState.connected_profile_id}
             onSelect={onSelectProfile}
             onImport={onImportProfile}
             onImportSubscription={onImportSubscription}
@@ -196,11 +234,13 @@ export default function App() {
             onDeleteGroup={onDeleteGroup}
             onMoveProfile={onMoveProfile}
           />
-        )}
-        {section === "session" && <SessionScreen appState={appState} onRefresh={onRefreshSession} />}
-        {section === "settings" && (
+        </div>
+        <div className="app-section" hidden={section !== "session"}>
+          <SessionScreen appState={appState} onRefresh={onRefreshSession} />
+        </div>
+        <div className="app-section" hidden={section !== "settings"}>
           <SettingsScreen settings={appState.settings} onChange={onChangeSetting} error={settingsError} />
-        )}
+        </div>
       </main>
     </div>
   );

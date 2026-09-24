@@ -10,6 +10,14 @@
   background: var(--md-surface);
 }
 
+.app-section {
+  height: 100%;
+}
+
+.app-section[hidden] {
+  display: none;
+}
+
 .app-loading {
   height: 100vh;
   display: flex;

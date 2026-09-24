@@ -60,6 +60,9 @@ pub struct AppData {
     /// that is still being built.
     busy: AtomicBool,
     pub exiting: AtomicBool,
+    /// Set when the saved library exists but couldn't be read: saving over
+    /// it would destroy it.
+    persist_blocked: AtomicBool,
     paths: Mutex<Option<Paths>>,
 }
 
@@ -73,12 +76,18 @@ impl Default for AppData {
             runtime: Mutex::new(Runtime::default()),
             busy: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
+            persist_blocked: AtomicBool::new(false),
             paths: Mutex::new(None),
         }
     }
 }
 
 impl AppData {
+    /// Whether a connect/disconnect/teardown is in flight.
+    pub fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
     pub fn has_routing(&self) -> bool {
         self.connection.lock().unwrap().is_some()
             || self.tun.lock().unwrap().is_some()
@@ -92,6 +101,9 @@ impl AppData {
     /// Saves the user's library. Called with the state lock held, so saves
     /// can't land out of order.
     fn persist(&self, app: &AppState) {
+        if self.persist_blocked.load(Ordering::SeqCst) {
+            return;
+        }
         if let Some(path) = self.with_paths(|p| p.state_file.clone()) {
             if let Err(e) = store::save(&path, app) {
                 eprintln!("riekko: failed to save state: {e}");
@@ -135,14 +147,62 @@ pub fn init(app: &AppHandle) {
     let data = app.state::<AppData>();
     let paths = Paths::resolve(app);
     crate::proxy::recover_after_crash(&paths.proxy_marker);
-    let mut state = store::load(&paths.state_file).unwrap_or_default();
+    let mut state = match store::load(&paths.state_file) {
+        Ok(loaded) => loaded.unwrap_or_default(),
+        Err(store::LoadError::Corrupt(message)) => AppState {
+            last_error: Some(message),
+            ..AppState::default()
+        },
+        Err(store::LoadError::Unreadable(message)) => {
+            data.persist_blocked.store(true, Ordering::SeqCst);
+            AppState {
+                last_error: Some(message),
+                ..AppState::default()
+            }
+        }
+    };
     // The OS is the source of truth for autostart (the user may have
     // removed the login item by hand).
     if let Ok(enabled) = app.autolaunch().is_enabled() {
         state.settings.start_with_system = enabled;
     }
+    let auto_connect =
+        state.settings.auto_connect && state.profile(&state.active_profile_id).is_some();
     *data.state.lock().unwrap() = state;
     *data.paths.lock().unwrap() = Some(paths);
+
+    spawn_monitor(app);
+    if auto_connect {
+        // Once per launch — a WebView reload must not reconnect after the
+        // user deliberately disconnected.
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let data = app.state::<AppData>();
+            let Some(_busy) = BusyGuard::acquire(&data.busy) else {
+                return;
+            };
+            if data.state.lock().unwrap().state == TunnelState::Idle {
+                let _ = connect(&app, &data);
+            }
+        });
+    }
+}
+
+/// Watches the session from the backend. The UI's own 1 s poll stops when
+/// the window is minimized (WebViews throttle and then suspend hidden
+/// timers), and a dead core must still be noticed — otherwise every app
+/// keeps routing into a SOCKS port nothing listens on.
+fn spawn_monitor(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let data = app.state::<AppData>();
+        while !data.exiting.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_secs(1));
+            if !data.exiting.load(Ordering::SeqCst) {
+                let _ = tick(&app);
+            }
+        }
+    });
 }
 
 /// Tears everything down for app exit. Best-effort: if the TUN teardown
@@ -206,7 +266,7 @@ fn reset_session(app: &mut AppState) {
 
 #[tauri::command]
 pub fn get_state(data: State<AppData>) -> AppState {
-    data.state.lock().unwrap().clone()
+    data.state.lock().unwrap().snapshot()
 }
 
 fn measure_latency_ms(addr: SocketAddr) -> Option<u32> {
@@ -282,7 +342,7 @@ fn disconnect(data: &AppData) -> Result<AppState, String> {
     app.state = TunnelState::Idle;
     app.last_error = None;
     reset_session(&mut app);
-    Ok(app.clone())
+    Ok(app.snapshot())
 }
 
 fn connect(handle: &AppHandle, data: &AppData) -> Result<AppState, String> {
@@ -304,6 +364,9 @@ fn connect(handle: &AppHandle, data: &AppData) -> Result<AppState, String> {
         app.state = TunnelState::Starting;
         app.last_error = None;
         reset_session(&mut app);
+        // From here on the UI names the profile being connected, and
+        // picking another one doesn't relabel the tunnel being built.
+        app.connected_profile_id = Some(profile.id.clone());
         app.session.endpoint = profile.endpoint.clone();
     }
 
@@ -319,7 +382,7 @@ fn connect(handle: &AppHandle, data: &AppData) -> Result<AppState, String> {
                 app.routing_mode = Some(routing_mode);
                 app.connected_profile_id = Some(profile.id.clone());
                 app.session.endpoint = profile.endpoint.clone();
-                app.clone()
+                app.snapshot()
             };
             spawn_latency_probe(handle);
             Ok(snapshot)
@@ -344,14 +407,19 @@ fn establish(
     let params = import::parse_connect_params(uri)?;
     let server = resolve_server(params.host(), params.port())?;
     let ports = engine::LocalPorts::pick()?;
+    let (tun_dir, proxy_marker) = data
+        .with_paths(|p| (p.tun_dir.clone(), p.proxy_marker.clone()))
+        .ok_or_else(|| "Приложение ещё не инициализировано".to_string())?;
     let core = engine::start(handle, &params, &server.to_string(), ports)?;
     let core_name = match params {
         ConnectParams::Vless(_) => "xray",
         ConnectParams::Hysteria2(_) => "hysteria",
     };
-    let (tun_dir, proxy_marker) = data
-        .with_paths(|p| (p.tun_dir.clone(), p.proxy_marker.clone()))
-        .ok_or_else(|| "Приложение ещё не инициализировано".to_string())?;
+    let core_pid = core.pid();
+    // Owned by AppData from the moment it exists, so quitting during the
+    // (possibly long) admin prompt still stops it and deletes its config.
+    *data.connection.lock().unwrap() = Some(core);
+    let drop_core = || drop(data.connection.lock().unwrap().take());
 
     // The core is up and listening on 127.0.0.1, but nothing
     // routes through it until something tells the OS to actually use it.
@@ -365,7 +433,7 @@ fn establish(
             // Only IPv4 is captured, so an IPv6 server needs no exclusion.
             IpAddr::V6(_) => None,
         },
-        core_pid: core.pid(),
+        core_pid,
         work_dir: &tun_dir,
     };
     let routing_mode = match tun::up(tun_request) {
@@ -379,6 +447,7 @@ fn establish(
                 RoutingMode::SystemProxy
             }
             Err(proxy_err) => {
+                drop_core();
                 return Err(format!(
                     "TUN недоступен ({tun_err}), а системный прокси тоже не удалось настроить ({proxy_err})"
                 ));
@@ -388,13 +457,19 @@ fn establish(
 
     // The admin prompt can take a while; the core may have given up in the
     // meantime (e.g. Hysteria2 rejecting the password).
-    if !core.is_alive() {
-        let reason = core.output_tail();
-        *data.connection.lock().unwrap() = Some(core);
-        let _ = release_routing(data);
-        return Err(format!("{core_name} остановился: {reason}"));
+    let died = {
+        let conn = data.connection.lock().unwrap();
+        conn.as_ref()
+            .filter(|c| !c.is_alive())
+            .map(|c| c.output_tail())
+    };
+    if let Some(reason) = died {
+        let message = format!("{core_name} остановился: {reason}");
+        return Err(match release_routing(data) {
+            Ok(()) => message,
+            Err(e) => format!("{message}. {e}"),
+        });
     }
-    *data.connection.lock().unwrap() = Some(core);
     Ok((routing_mode, SocketAddr::new(server, params.port())))
 }
 
@@ -410,9 +485,13 @@ fn tick(handle: &AppHandle) -> AppState {
     // half-built. And only a live session can fail: once a teardown has
     // failed (the user declined the fallback prompt), the state is Error and
     // retrying is left to the user instead of re-prompting every second.
+    // The busy flag is only taken once there is a failure to handle, so a
+    // routine tick can't make a Connect click bounce with "please wait".
     let active = data.state.lock().unwrap().state.is_active();
-    if let Some(_busy) = active.then(|| BusyGuard::acquire(&data.busy)).flatten() {
-        if let Some(failure) = detect_failure(&data) {
+    let suspect = active && detect_failure(&data).is_some();
+    if let Some(_busy) = suspect.then(|| BusyGuard::acquire(&data.busy)).flatten() {
+        let still_active = data.state.lock().unwrap().state.is_active();
+        if let Some(failure) = detect_failure(&data).filter(|_| still_active) {
             let teardown = release_routing(&data);
             let message = match teardown {
                 Ok(()) => failure,
@@ -452,7 +531,7 @@ fn tick(handle: &AppHandle) -> AppState {
             _ => {}
         }
         let changed = (previous != app.state).then_some(app.state);
-        let snapshot = app.clone();
+        let snapshot = app.snapshot();
         drop(app);
         match changed {
             Some(TunnelState::Reconnecting) => notify(
@@ -469,7 +548,7 @@ fn tick(handle: &AppHandle) -> AppState {
         }
         return snapshot;
     }
-    app.clone()
+    app.snapshot()
 }
 
 /// Why the running session is dead, if it is.
@@ -506,7 +585,7 @@ pub async fn refresh_session(app: AppHandle) -> Result<AppState, String> {
                 state.session.latency_ms = latency;
             }
         }
-        let snapshot = data.state.lock().unwrap().clone();
+        let snapshot = data.state.lock().unwrap().snapshot();
         snapshot
     })
     .await
@@ -517,7 +596,7 @@ pub fn select_profile(id: String, data: State<AppData>) -> AppState {
     let mut app = data.state.lock().unwrap();
     app.select(&id);
     data.persist(&app);
-    app.clone()
+    app.snapshot()
 }
 
 #[tauri::command]
@@ -530,7 +609,7 @@ pub fn import_profile(uri: String, data: State<AppData>) -> Result<AppState, Str
     app.profiles.push(profile);
     app.ensure_selection();
     data.persist(&app);
-    Ok(app.clone())
+    Ok(app.snapshot())
 }
 
 #[tauri::command]
@@ -539,7 +618,7 @@ pub fn remove_profile(id: String, data: State<AppData>) -> AppState {
     app.profiles.retain(|p| p.id != id);
     app.ensure_selection();
     data.persist(&app);
-    app.clone()
+    app.snapshot()
 }
 
 #[tauri::command]
@@ -566,7 +645,7 @@ pub fn update_setting(
         other => return Err(format!("Неизвестная настройка: {other}")),
     }
     data.persist(&state);
-    Ok(state.clone())
+    Ok(state.snapshot())
 }
 
 #[tauri::command]
@@ -583,7 +662,7 @@ pub fn create_group(name: String, data: State<AppData>) -> AppState {
         name: final_name,
     });
     data.persist(&app);
-    app.clone()
+    app.snapshot()
 }
 
 #[tauri::command]
@@ -596,7 +675,7 @@ pub fn rename_group(id: String, name: String, data: State<AppData>) -> AppState 
         }
     }
     data.persist(&app);
-    app.clone()
+    app.snapshot()
 }
 
 #[tauri::command]
@@ -609,7 +688,7 @@ pub fn delete_group(id: String, data: State<AppData>) -> AppState {
         }
     }
     data.persist(&app);
-    app.clone()
+    app.snapshot()
 }
 
 #[tauri::command]
@@ -628,7 +707,7 @@ pub fn move_profile_to_group(
         profile.group_id = target;
     }
     data.persist(&app);
-    app.clone()
+    app.snapshot()
 }
 
 #[derive(Serialize, Clone)]
@@ -717,7 +796,7 @@ pub async fn import_subscription(
     data.persist(&app);
 
     Ok(ImportSubscriptionResult {
-        state: app.clone(),
+        state: app.snapshot(),
         added,
         group_name,
     })

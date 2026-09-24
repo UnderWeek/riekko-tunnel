@@ -5,10 +5,45 @@ use crate::state::{AppState, PersistedState};
 use std::io::Write as _;
 use std::path::Path;
 
-pub fn load(path: &Path) -> Option<AppState> {
-    let bytes = std::fs::read(path).ok()?;
-    let persisted: PersistedState = serde_json::from_slice(&bytes).ok()?;
-    Some(persisted.into_app())
+/// Why the saved library couldn't be used.
+pub enum LoadError {
+    /// The file exists but couldn't be read (permissions, I/O): it must not
+    /// be overwritten, since it may be perfectly fine.
+    Unreadable(String),
+    /// The file doesn't parse; it was moved aside so a fresh one can start.
+    Corrupt(String),
+}
+
+/// `Ok(None)` on a first launch. A broken file is never silently replaced
+/// by an empty library: it's either left alone (unreadable) or moved aside
+/// to `state.corrupt-<time>.json` (unparseable), and the caller is told.
+pub fn load(path: &Path) -> Result<Option<AppState>, LoadError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(LoadError::Unreadable(format!(
+            "Не удалось прочитать сохранённые профили ({e}); изменения в этом сеансе не сохранятся"
+        ))),
+    };
+    match serde_json::from_slice::<PersistedState>(&bytes) {
+        Ok(persisted) => Ok(Some(persisted.into_app())),
+        Err(e) => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let backup = path.with_file_name(format!("state.corrupt-{stamp}.json"));
+            let moved = std::fs::rename(path, &backup).is_ok();
+            Err(LoadError::Corrupt(if moved {
+                format!(
+                    "Файл с профилями повреждён ({e}). Копия сохранена как {}",
+                    backup.display()
+                )
+            } else {
+                format!("Файл с профилями повреждён ({e})")
+            }))
+        }
+    }
 }
 
 /// Writes atomically (temp file + rename), so a crash mid-write can't
@@ -73,7 +108,7 @@ mod tests {
         app.state = crate::state::TunnelState::Connected;
 
         save(&path, &app).unwrap();
-        let loaded = load(&path).unwrap();
+        let loaded = load(&path).ok().flatten().unwrap();
         assert_eq!(loaded.profiles.len(), 2);
         assert_eq!(loaded.groups[0].name, "Work");
         assert_eq!(loaded.active_profile_id, "p1");
@@ -93,12 +128,26 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_corrupt_file_is_not_fatal() {
+    fn missing_file_is_a_first_launch_and_corrupt_one_is_kept_aside() {
         let dir = std::env::temp_dir().join(crate::state::unique_id("riekko-test-store"));
-        assert!(load(&dir.join("nope.json")).is_none());
+        assert!(matches!(load(&dir.join("state.json")), Ok(None)));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("bad.json"), b"{not json").unwrap();
-        assert!(load(&dir.join("bad.json")).is_none());
+        let path = dir.join("state.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(matches!(load(&path), Err(LoadError::Corrupt(_))));
+        // The broken file was moved aside, not left to be overwritten.
+        assert!(!path.exists());
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("state.corrupt-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(backups[0].path()).unwrap(), b"{not json");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

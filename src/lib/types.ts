@@ -38,6 +38,8 @@ export interface SessionInfo {
 }
 
 export interface AppState {
+  /** Backend snapshot order: higher = taken later. */
+  revision: number;
   state: TunnelState;
   routing_mode: RoutingMode | null;
   groups: Group[];

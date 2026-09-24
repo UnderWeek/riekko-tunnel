@@ -85,6 +85,10 @@ pub struct SessionInfo {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppState {
+    /// Stamped by `snapshot()` under the state lock: tells the UI which of
+    /// two out-of-order answers reflects the later state.
+    #[serde(default)]
+    pub revision: u64,
     pub state: TunnelState,
     pub routing_mode: Option<RoutingMode>,
     pub groups: Vec<Group>,
@@ -105,6 +109,7 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            revision: 0,
             state: TunnelState::Idle,
             routing_mode: None,
             groups: Vec::new(),
@@ -119,6 +124,15 @@ impl Default for AppState {
 }
 
 impl AppState {
+    /// A copy for the UI, stamped with a fresh revision. Must be called
+    /// while holding the state lock, so revision order is state order.
+    pub fn snapshot(&self) -> AppState {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let mut copy = self.clone();
+        copy.revision = NEXT.fetch_add(1, Ordering::Relaxed);
+        copy
+    }
+
     pub fn profile(&self, id: &str) -> Option<&Profile> {
         self.profiles.iter().find(|p| p.id == id)
     }

@@ -66,7 +66,9 @@ export function SessionScreen({
       <div className="stat-grid">
         <div className="stat-card">
           <span className="stat-card__label">Endpoint</span>
-          <span className="stat-card__value stat-card__value--small">{session.endpoint || "—"}</span>
+          <span className="stat-card__value stat-card__value--small" title={session.endpoint || undefined}>
+            {session.endpoint || "—"}
+          </span>
         </div>
         <div className="stat-card">
           <span className="stat-card__label">Latency</span>

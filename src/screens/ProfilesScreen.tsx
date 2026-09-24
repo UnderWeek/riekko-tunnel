@@ -39,6 +39,7 @@ export function ProfilesScreen({
   profiles,
   groups,
   activeProfileId,
+  connectedProfileId,
   onSelect,
   onImport,
   onImportSubscription,
@@ -51,6 +52,8 @@ export function ProfilesScreen({
   profiles: Profile[];
   groups: Group[];
   activeProfileId: string;
+  /** The profile the running tunnel uses (may differ from the selection). */
+  connectedProfileId: string | null;
   onSelect: (id: string) => void;
   onImport: (uri: string) => Promise<void>;
   onImportSubscription: (url: string) => Promise<{ added: number; groupName: string }>;
@@ -350,6 +353,7 @@ export function ProfilesScreen({
                     <div className="profile-list">
                       {groupProfiles.map((profile) => {
                         const selected = profile.id === activeProfileId;
+                        const connected = profile.id === connectedProfileId;
                         const isDragging = draggingId === profile.id;
                         return (
                           <div
@@ -374,11 +378,18 @@ export function ProfilesScreen({
                                 {profile.endpoint} · {profile.transport}
                               </span>
                             </div>
-                            {selected && (
+                            {connected ? (
                               <span className="profile-row__badge">
-                                <Icon name="check-circle" size={16} />
-                                Активен
+                                <Icon name="vpn-lock" size={16} />
+                                Подключён
                               </span>
+                            ) : (
+                              selected && (
+                                <span className="profile-row__badge">
+                                  <Icon name="check-circle" size={16} />
+                                  Выбран
+                                </span>
+                              )
                             )}
                             <Button
                               variant="icon"

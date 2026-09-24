@@ -126,12 +126,18 @@
     transform var(--motion-fast) var(--motion-standard-curve);
 }
 
-.connect-button:hover:not(:disabled) {
+.connect-button:hover:not(:disabled):not([aria-disabled="true"]) {
   box-shadow: var(--elevation-3);
 }
 
-.connect-button:active:not(:disabled) {
+.connect-button:active:not(:disabled):not([aria-disabled="true"]) {
   transform: scale(0.98);
+}
+
+.connect-button[aria-disabled="true"] {
+  cursor: progress;
+  opacity: 0.7;
+  box-shadow: none;
 }
 
 .connect-button:disabled {
